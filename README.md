@@ -56,7 +56,7 @@ cannot crater. Either subdivide it or raise `Contact Subdivisions`.
 | **Contact Distance** | 0.3 m | Radius of the whole effect; everything else fades to nothing here. Start around ⅓ of the object's width. |
 | **Surface Offset** | 0.002 m | How far *inside* the object the conformed ground lands, so it does not z-fight along the contact band. Keep it small and positive. |
 | **Displace Ground** | on | Conform the ground at all. Off means shading and material blending only, and the target stays visible. |
-| **Ground Conform** | 1.0 | Master multiplier on the conform. **At 0 the ground cannot move and there is no blend** — the panel warns about this. |
+| **Ground Conform** | 1.0 | Master multiplier on the conform. **At 0 the ground cannot move and there is no blend** the panel warns about this. |
 | **Contact Subdivisions** | 2 | Subdivides only the contact island. Each level is 4× the faces, so 4 is 256× per face; 2 is usually plenty. |
 | **Ground Detail** | 0.0 m | Height of the contact-zone displacement. |
 | **Detail Image** | | Height map for that displacement. |
