@@ -1,6 +1,6 @@
 # Contact Blend
 
-A Blender add-on that sinks one mesh into another without booleans — no destructive cuts, no
+A Blender add-on that sinks one mesh into another without booleans no destructive cuts, no
 retopology, fully non-destructive and animatable.
 
 Instead of deforming your hero mesh, it conforms the **ground** to it. The ground craters under
@@ -25,7 +25,7 @@ socket name, so updating never means hunting down and deleting the old node grou
 <details>
 <summary><b>Upgrading from Blend To Surface (1.0)</b></summary>
 
-Remove the old `blend_to_surface.py` from your add-ons first — leaving both enabled registers two
+Remove the old `blend_to_surface.py` from your add-ons first leaving both enabled registers two
 panels and two menu entries over the same node group.
 
 Existing `.blend` files need nothing: opening one renames its node group and material mix node in
@@ -59,7 +59,7 @@ cannot crater. Either subdivide it or raise `Contact Subdivisions`.
 | **Ground Conform** | 1.0 | Master multiplier on the conform. **At 0 the ground cannot move and there is no blend** — the panel warns about this. |
 | **Contact Subdivisions** | 2 | Subdivides only the contact island. Each level is 4× the faces, so 4 is 256× per face; 2 is usually plenty. |
 | **Ground Detail** | 0.0 m | Height of the contact-zone displacement. |
-| **Detail Image** | — | Height map for that displacement. |
+| **Detail Image** | | Height map for that displacement. |
 | **Detail UV Map** | `UVMap` | Which UV map to sample it through. |
 | **Detail Midlevel** | 0.0 | Value that means "no displacement". Set **0.5** for a real height map; the 0 default makes an unset image a no-op. |
 | **Normal Blend Distance** | 0.2 m | Over what distance the object's shading normals rotate to match the ground's. |
@@ -95,7 +95,7 @@ why each ordering is the way it is.
   the target above this one, or use `Ground Detail`.
 - **Meniscus smoothness is capped by ground resolution.** `Contact Subdivisions` helps; the crater's
   silhouette against the object stays as fine as the mesh allows.
-- **Flat slabs don't chain.** Blending a patch into a floor it lies parallel to does nothing useful —
+- **Flat slabs don't chain.** Blending a patch into a floor it lies parallel to does nothing useful
   every vertex is equidistant, so a proximity falloff has nothing to grip.
 - Blending several objects into one target joins a copy of that target into each of them.
 
@@ -110,7 +110,7 @@ is tearing, and the node group's version stamp.
 
 ## Development
 
-The add-on is self-testing — it builds a scene, evaluates the modifier and asserts on the result:
+The add-on is self-testing it builds a scene, evaluates the modifier and asserts on the result:
 
 ```bash
 blender --background --python contact_blend.py
@@ -130,8 +130,5 @@ migrates without orphaning its modifier.
 
 ## License
 
-[Apache-2.0](LICENSE), matching the `LICENSE` file in this repository.
+[Apache-2.0](LICENSE)
 
-Note that Blender add-ons importing `bpy` are widely held to be GPL derivative works, and the
-Blender Extensions platform accepts GPL-compatible licenses only. Apache-2.0 is one-way compatible
-with GPL-3.0 but not with GPL-2.0, so publishing there may require relicensing.
