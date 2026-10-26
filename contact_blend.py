@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Contact Blend",
     "author": "amsy",
-    "version": (1, 1),
+    "version": (1, 3),
     "blender": (4, 5, 0),
     "location": "Object > Contact Blend",
     "description": "Boolean-free blend of one mesh into another: the ground conforms to the object, plus custom normal weld and a 'blend' attribute for material mixing",
@@ -26,12 +26,18 @@ LEGACY_NAMES = ("Blend To Surface",)
 # number, so an existing .blend picks up fixes on reload instead of silently running the tree
 # it was first built with -- a stale group is indistinguishable from a bug that did not get
 # fixed, and telling people to delete it by hand is exactly how it survives.
-GROUP_VERSION = 5
+GROUP_VERSION = 6
 # The stamp moved with the rename. An old group carries the value under the old key, so read
 # both and rewrite to the current one -- treating the old key as unstamped would force a
 # needless rebuild, and the diagnostic would report a group of unknown vintage.
 VERSION_KEY = "cb_version"
 LEGACY_VERSION_KEYS = ("bts_version",)
+GENERATED_KEY = "cb_generated"
+ISOLATED_KEY = "cb_isolated_material"
+VISIBILITY_KEY = "cb_original_visibility"
+HIDDEN_TARGET_KEY = "cb_hidden_target"
+TARGET_UV_ATTR = "cb_target_uv"
+TEXTURE_DATA_KEY = "cb_texture_data"
 
 
 def _socket(ng, name, stype, in_out="INPUT", **kw):
@@ -171,6 +177,11 @@ def _build_group(ng):
     _socket(ng, "Detail Midlevel", "NodeSocketFloat", default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")
     _socket(ng, "Normal Blend Distance", "NodeSocketFloat", default_value=0.2, min_value=0.0, subtype="DISTANCE")
     _socket(ng, "Material Blend Distance", "NodeSocketFloat", default_value=0.3, min_value=0.0, subtype="DISTANCE")
+    _socket(ng, "Match Target Textures", "NodeSocketBool", default_value=True)
+    _socket(ng, "Target UV Map", "NodeSocketString", default_value="UVMap")
+    # Internal material bindings are configured by setup_material(), not by the user.
+    _socket(ng, "Target Material", "NodeSocketMaterial")
+    _socket(ng, "Ground Material", "NodeSocketMaterial")
 
     link = ng.links.new
     gin = _node(ng, "NodeGroupInput", -1100, 0)
@@ -319,12 +330,49 @@ def _build_group(ng):
     # ground keeps whatever shading it came with and nothing discontinuous is introduced.
     tgt = sp.outputs["Geometry"]
 
+    # Sample UVs from the final conformed ground, whose original corner UVs have survived
+    # subdivision and displacement. Sampling before the conform makes the two sides slide
+    # apart. Keep this downstream of the conform to avoid a source/target dependency cycle.
+    uv_geo = _node(ng, "GeometryNodeSwitch", 850, -1600, input_type="GEOMETRY")
+    link(g["Displace Ground"], uv_geo.inputs[0])
+    link(obj.outputs["Geometry"], uv_geo.inputs[1])
+    link(tgt, uv_geo.inputs[2])
+    target_uv = _node(ng, "GeometryNodeInputNamedAttribute", 850, -1800, data_type="FLOAT_VECTOR")
+    link(g["Target UV Map"], target_uv.inputs["Name"])
+    sample_uv = _node(ng, "GeometryNodeSampleNearestSurface", 1050, -1600, data_type="FLOAT_VECTOR")
+    link(uv_geo.outputs["Output"], sample_uv.inputs["Mesh"])
+    link(target_uv.outputs["Attribute"], sample_uv.inputs["Value"])
+    link(pos.outputs["Position"], sample_uv.inputs["Sample Position"])
+    mapped_src = _node(ng, "GeometryNodeStoreNamedAttribute", 1250, -1600,
+                       data_type="FLOAT2", domain="CORNER")
+    mapped_src.inputs["Name"].default_value = TARGET_UV_ATTR
+    link(src, mapped_src.inputs["Geometry"])
+    link(sample_uv.outputs["Value"], mapped_src.inputs["Value"])
+    uv_switch = _node(ng, "GeometryNodeSwitch", 1450, -1600, input_type="GEOMETRY")
+    link(g["Match Target Textures"], uv_switch.inputs[0])
+    link(src, uv_switch.inputs[1])
+    link(mapped_src.outputs["Geometry"], uv_switch.inputs[2])
+    shaded_src = uv_switch.outputs["Output"]
+
+    # Object/Generated coordinates on joined ground otherwise use the hero's transform
+    # and texture space. Replace only the active target material with a corrected copy.
+    material_selection = _node(ng, "GeometryNodeMaterialSelection", 1000, -2100)
+    link(g["Target Material"], material_selection.inputs["Material"])
+    ground_mat = _node(ng, "GeometryNodeSetMaterial", 1250, -2100)
+    link(tgt, ground_mat.inputs["Geometry"])
+    link(material_selection.outputs["Selection"], ground_mat.inputs["Selection"])
+    link(g["Ground Material"], ground_mat.inputs["Material"])
+    ground_switch = _node(ng, "GeometryNodeSwitch", 1450, -2100, input_type="GEOMETRY")
+    link(g["Match Target Textures"], ground_switch.inputs[0])
+    link(tgt, ground_switch.inputs[1])
+    link(ground_mat.outputs["Geometry"], ground_switch.inputs[2])
+
     join = _node(ng, "GeometryNodeJoinGeometry", 700, -100)
-    link(tgt, join.inputs["Geometry"])
-    link(src, join.inputs["Geometry"])
+    link(ground_switch.outputs["Output"], join.inputs["Geometry"])
+    link(shaded_src, join.inputs["Geometry"])
     sw = _node(ng, "GeometryNodeSwitch", 900, 0, input_type="GEOMETRY")
     link(g["Displace Ground"], sw.inputs[0])
-    link(src, sw.inputs[1])
+    link(shaded_src, sw.inputs[1])
     link(join.outputs["Geometry"], sw.inputs[2])
 
     # --- weld the shading: near the target, adopt the target's normal ---
@@ -388,12 +436,193 @@ def _copy_nodes(src_tree, dst_tree, offset):
     return m
 
 
-def setup_material(src, tgt):
+def _target_uv_name(tgt):
+    layers = tgt.data.uv_layers
+    render = next((layer for layer in layers if layer.active_render), None)
+    return render.name if render else (layers.active.name if layers.active else "")
+
+
+def _match_texture_nodes(tree, tgt, uv_name, project_uv, groups=None, node_names=None):
+    """Bind a copied shader to target space; never edit shared shader groups in place."""
+    groups = {} if groups is None else groups
+    warnings = set()
+    nodes = [n for n in tree.nodes if node_names is None or n.name in node_names]
+    uv_node_name = None
+    generated_node_name = None
+
+    def new(kind):
+        node = tree.nodes.new(kind)
+        node[GENERATED_KEY] = "target"
+        return node
+
+    def uv_output():
+        nonlocal uv_node_name
+        if uv_node_name is None:
+            node = new("ShaderNodeUVMap")
+            node.uv_map = TARGET_UV_ATTR if project_uv else uv_name
+            uv_node_name = node.name
+            if uv_name not in tgt.data.uv_layers:
+                warnings.add("Target UV map is missing; check Target UV Map")
+        return tree.nodes[uv_node_name].outputs["UV"]
+
+    def generated_output():
+        nonlocal generated_node_name
+        if generated_node_name is None:
+            coord = new("ShaderNodeTexCoord")
+            coord.object = tgt
+            coord_name = coord.name
+            subtract = new("ShaderNodeVectorMath")
+            subtract.operation = "SUBTRACT"
+            subtract.inputs[1].default_value = tgt.data.texspace_location
+            subtract_name = subtract.name
+            tree.links.new(tree.nodes[coord_name].outputs["Object"], subtract.inputs[0])
+            divide = new("ShaderNodeVectorMath")
+            divide.operation = "DIVIDE"
+            divide.inputs[1].default_value = tuple(2 * v for v in tgt.data.texspace_size)
+            divide_name = divide.name
+            tree.links.new(tree.nodes[subtract_name].outputs["Vector"], divide.inputs[0])
+            add = new("ShaderNodeVectorMath")
+            add.operation = "ADD"
+            add.inputs[1].default_value = (0.5, 0.5, 0.5)
+            generated_node_name = add.name
+            tree.links.new(tree.nodes[divide_name].outputs["Vector"], add.inputs[0])
+        return tree.nodes[generated_node_name].outputs["Vector"]
+
+    def redirect(node_name, output_name, replacement):
+        destinations = [(link.to_node.name, list(link.to_node.inputs).index(link.to_socket))
+                        for link in tree.nodes[node_name].outputs[output_name].links]
+        for name, index in destinations:
+            tree.links.new(replacement, tree.nodes[name].inputs[index])
+
+    procedural = {"TEX_NOISE", "TEX_VORONOI", "TEX_WAVE", "TEX_CHECKER", "TEX_BRICK",
+                  "TEX_GRADIENT", "TEX_MAGIC", "TEX_WHITE_NOISE", "TEX_GABOR"}
+    for original in nodes:
+        name, kind = original.name, original.type
+        if kind == "GROUP" and original.node_tree:
+            old = original.node_tree
+            if old not in groups:
+                copied = old.copy()
+                copied.name = old.name + " (Contact Blend)"
+                copied.use_fake_user = False
+                copied[TEXTURE_DATA_KEY] = True
+                groups[old] = copied
+                warnings |= _match_texture_nodes(copied, tgt, uv_name, project_uv, groups)
+            tree.nodes[name].node_tree = groups[old]
+        elif kind == "TEX_COORD":
+            if original.from_instancer:
+                warnings.add("Instancer texture coordinates are not projected")
+                continue
+            if original.outputs["Generated"].is_linked:
+                redirect(name, "Generated", generated_output())
+            if tree.nodes[name].outputs["UV"].is_linked:
+                redirect(name, "UV", uv_output())
+            if tree.nodes[name].object is None:
+                tree.nodes[name].object = tgt
+        elif kind in {"UVMAP", "NORMAL_MAP"}:
+            node = tree.nodes[name]
+            uses_uv = kind == "UVMAP" or node.space == "TANGENT"
+            if uses_uv:
+                if kind == "UVMAP" and node.from_instancer:
+                    warnings.add("Instancer UV coordinates are not projected")
+                elif not node.uv_map or node.uv_map == uv_name:
+                    node.uv_map = TARGET_UV_ATTR if project_uv else uv_name
+                    if uv_name not in tgt.data.uv_layers:
+                        warnings.add("Target UV map is missing; check Target UV Map")
+                elif project_uv:
+                    warnings.add(f"Additional UV map '{node.uv_map}' is not projected")
+        elif kind == "ATTRIBUTE" and project_uv:
+            if original.attribute_type == "GEOMETRY" and original.attribute_name == uv_name:
+                tree.nodes[name].attribute_name = TARGET_UV_ATTR
+        elif kind == "TEX_IMAGE" and not original.inputs["Vector"].is_linked:
+            output = uv_output()
+            tree.links.new(output, tree.nodes[name].inputs["Vector"])
+        elif kind in procedural and not original.inputs["Vector"].is_linked:
+            output = generated_output()
+            tree.links.new(output, tree.nodes[name].inputs["Vector"])
+    return warnings
+
+
+def _cleanup_texture_data():
+    """Discard unused copies made by refresh/removal, retaining anything used elsewhere."""
+    for mat in list(bpy.data.materials):
+        if mat.get(TEXTURE_DATA_KEY) and mat.users == 0:
+            bpy.data.materials.remove(mat)
+    while True:
+        unused = [ng for ng in bpy.data.node_groups if ng.get(TEXTURE_DATA_KEY) and ng.users == 0]
+        if not unused:
+            break
+        for ng in unused:
+            bpy.data.node_groups.remove(ng)
+
+
+def _texture_settings(src, tgt):
+    mod = find_mod(src)
+    uv_name = _target_uv_name(tgt)
+    if not mod:
+        return True, uv_name, None
+    ids = input_ids(mod.node_group)
+    if not mod.get("cb_uv_initialized") or mod.get("cb_uv_target") != tgt:
+        mod[ids["Target UV Map"]] = uv_name
+        mod["cb_uv_initialized"] = True
+        mod["cb_uv_target"] = tgt
+    return bool(mod[ids["Match Target Textures"]]), mod[ids["Target UV Map"]], mod
+
+
+def _material_mix(mat):
+    if not mat or not mat.use_nodes:
+        return None
+    nodes = mat.node_tree.nodes
+    tagged = next((n for n in nodes if n.type == "MIX_SHADER"
+                   and n.get(GENERATED_KEY) == "mix"), None)
+    if tagged:
+        return tagged
+    return next((n for n in nodes if n.type == "MIX_SHADER"
+                 and not n.get(GENERATED_KEY) and n.name in (GROUP,) + LEGACY_NAMES), None)
+
+
+def _private_material(src, slot):
+    """Use an object-linked copy, including when the object's mesh data is shared."""
+    mat = slot.material
+    shared = any(o is not src and any(s.material == mat for s in o.material_slots)
+                 for o in bpy.data.objects)
+    if not mat.get(ISOLATED_KEY) or shared or slot.link != "OBJECT":
+        mat = mat.copy()
+        mat.name += " (Contact Blend)"
+        mat[ISOLATED_KEY] = True
+        slot.link = "OBJECT"
+        slot.material = mat
+    return mat
+
+
+def _prune_generated(tree, names):
+    """Delete owned nodes, retaining any branches the user has wired elsewhere."""
+    keep = {l.from_node.name for l in tree.links
+            if l.from_node.name in names and l.to_node.name not in names}
+    while True:
+        upstream = {l.from_node.name for l in tree.links
+                    if l.to_node.name in keep and l.from_node.name in names}
+        if upstream <= keep:
+            break
+        keep |= upstream
+    for name in names - keep:
+        node = tree.nodes.get(name)
+        if node:
+            tree.nodes.remove(node)
+    for name in keep:
+        node = tree.nodes.get(name)
+        if node and GENERATED_KEY in node:
+            del node[GENERATED_KEY]
+
+
+def setup_material(src, tgt, refresh=False):
     """Mix the target's shader into the source's, driven by the `blend` attribute.
 
     Returns a message on failure, None on success. Idempotent: the mix node is named
-    GROUP, so re-running on an already-wired material is a no-op.
+    GROUP, so re-running on an already-wired material is a no-op. Explicit refresh
+    replaces only the generated target branch, preserving the source shader and user nodes.
     """
+    if src is tgt:
+        return "The blend object cannot be its own target"
     smat, tmat = src.active_material, tgt.active_material
     sout, sshader = _surface(smat)
     _, tshader = _surface(tmat)
@@ -401,14 +630,16 @@ def setup_material(src, tgt):
         return f"'{src.name}' has no node material with a linked Surface"
     if not tshader:
         return f"'{tgt.name}' has no node material with a linked Surface"
+    smat = _private_material(src, src.material_slots[src.active_material_index])
+    sout, sshader = _surface(smat)
     st = smat.node_tree
     # Also recognise the pre-1.1 node name, and move it forward while we are here. Missing it
     # would not raise -- it would silently mix a second copy of the target shader into a
     # material that was already wired, every time the button is pressed.
-    for name in (GROUP,) + LEGACY_NAMES:
-        node = st.nodes.get(name)
-        if node and node.type == "MIX_SHADER":
-            node.name = node.label = GROUP
+    mix = _material_mix(smat)
+    if mix:
+        mix.name = mix.label = GROUP
+        if not refresh:
             return None
 
     # nodes.new() can invalidate existing RNA pointers, so note how to find the sockets
@@ -417,18 +648,46 @@ def setup_material(src, tgt):
     sh_idx = list(sshader.node.outputs).index(sshader)
     tgt_name, tgt_idx = tshader.node.name, list(tshader.node.outputs).index(tshader)
 
+    old_target_nodes = {n.name for n in st.nodes if n.get(GENERATED_KEY) == "target"}
+    mix_name = mix.name if mix else None
     offset = (sshader.node.location[0] - 600, sshader.node.location[1] - 900)
     m = _copy_nodes(tmat.node_tree, st, offset)
+    for node in m.values():
+        node[GENERATED_KEY] = "target"
     copy_name = m[tmat.node_tree.nodes[tgt_name]].name
+    match_textures, uv_name, mod = _texture_settings(src, tgt)
+    warnings = set()
+    if match_textures:
+        warnings = _match_texture_nodes(st, tgt, uv_name, True,
+                                       node_names={node.name for node in m.values()})
+    smat["cb_texture_warnings"] = "\n".join(sorted(warnings))
+    if mod:
+        ids = input_ids(mod.node_group)
+        ground = tmat
+        if match_textures:
+            ground = tmat.copy()
+            ground.name = tmat.name + " (Contact Blend Ground)"
+            ground.use_fake_user = False
+            ground[TEXTURE_DATA_KEY] = True
+            _match_texture_nodes(ground.node_tree, tgt, uv_name, False)
+        mod[ids["Target Material"]] = tmat
+        mod[ids["Ground Material"]] = ground
+    if mix_name:
+        st.links.new(st.nodes[copy_name].outputs[tgt_idx], st.nodes[mix_name].inputs[2])
+        _prune_generated(st, old_target_nodes)
+        _cleanup_texture_data()
+        return None
     base = tuple(st.nodes[out_name].location)
 
     attr = st.nodes.new("ShaderNodeAttribute")
     attr.attribute_type = "GEOMETRY"
     attr.attribute_name = ATTR
+    attr[GENERATED_KEY] = "attribute"
     attr.location = (base[0] - 500, base[1] - 400)
     attr_name = attr.name
     mix = st.nodes.new("ShaderNodeMixShader")
     mix.name = mix.label = GROUP
+    mix[GENERATED_KEY] = "mix"
     mix.location = (base[0] - 200, base[1])
     mix_name = mix.name
 
@@ -437,7 +696,31 @@ def setup_material(src, tgt):
     st.links.new(n[sh_name].outputs[sh_idx], mix.inputs[1])     # blend=0: source shader
     st.links.new(n[copy_name].outputs[tgt_idx], mix.inputs[2])  # blend=1: target shader
     st.links.new(mix.outputs[0], n[out_name].inputs["Surface"])
+    _cleanup_texture_data()
     return None
+
+
+def remove_material_blend(src):
+    """Unwrap blend nodes without discarding edits made to the isolated material."""
+    for slot in src.material_slots:
+        if not _material_mix(slot.material):
+            continue
+        mat = _private_material(src, slot)
+        tree = mat.node_tree
+        mix = _material_mix(mat)
+        base = mix.inputs[1].links[0].from_socket if mix.inputs[1].is_linked else None
+        destinations = [link.to_socket for link in mix.outputs[0].links]
+        if base:
+            for socket in destinations:
+                tree.links.new(base, socket)
+        else:
+            for link in list(mix.outputs[0].links):
+                tree.links.remove(link)
+        # Untagged legacy target nodes cannot be distinguished from user nodes: leave
+        # them disconnected rather than risk removing part of a hand-edited shader.
+        names = {n.name for n in tree.nodes if n.get(GENERATED_KEY)}
+        names.add(mix.name)
+        _prune_generated(tree, names)
 
 
 def input_ids(ng):
@@ -456,6 +739,56 @@ def find_mod(obj):
 
 def mod_target(mod):
     return mod[input_ids(mod.node_group)["Target"]] if mod and mod.node_group else None
+
+
+def _hide_target(tgt, ctx):
+    """Remember visibility once per target and per scene/view layer before hiding."""
+    if VISIBILITY_KEY not in tgt:
+        tgt[VISIBILITY_KEY] = {"render": tgt.hide_render, "layers": {}}
+    state = tgt[VISIBILITY_KEY]
+    recorded = any(saved.get("scene") == ctx.scene and saved["layer"] == ctx.view_layer.name
+                   for saved in state["layers"].values())
+    if not recorded:
+        key = str(len(state["layers"]))
+        state["layers"][key] = {"scene": ctx.scene, "layer": ctx.view_layer.name,
+                                "hidden": tgt.hide_get(view_layer=ctx.view_layer)}
+    tgt.hide_set(True, view_layer=ctx.view_layer)
+    tgt.hide_render = True
+
+
+def _restore_target(tgt):
+    """Restore only after the last ground-copy user releases the target."""
+    if not tgt or VISIBILITY_KEY not in tgt:
+        return
+    for obj in bpy.data.objects:
+        for mod in obj.modifiers:
+            if (mod.type == "NODES" and mod.node_group
+                    and mod.node_group.name in (GROUP,) + LEGACY_NAMES
+                    and mod_target(mod) == tgt
+                    and mod[input_ids(mod.node_group)["Displace Ground"]]):
+                return
+    state = tgt[VISIBILITY_KEY]
+    # A changed flag belongs to the user; restore only values still set by us.
+    if tgt.hide_render:
+        tgt.hide_render = state["render"]
+    for saved in state["layers"].values():
+        scene = saved.get("scene")
+        layer = scene.view_layers.get(saved["layer"]) if scene else None
+        if layer and tgt.hide_get(view_layer=layer):
+            tgt.hide_set(saved["hidden"], view_layer=layer)
+    del tgt[VISIBILITY_KEY]
+
+
+def _sync_target_visibility(mod, ctx):
+    tgt = mod_target(mod)
+    old = mod.get(HIDDEN_TARGET_KEY)
+    ground_on = mod[input_ids(mod.node_group)["Displace Ground"]]
+    if old and (old != tgt or not ground_on):
+        del mod[HIDDEN_TARGET_KEY]
+        _restore_target(old)
+    if tgt and ground_on:
+        _hide_target(tgt, ctx)
+        mod[HIDDEN_TARGET_KEY] = tgt
 
 
 def target_leaks(mod):
@@ -506,35 +839,90 @@ class CONTACTBLEND_OT_add(bpy.types.Operator):
 
     def execute(self, ctx):
         src = ctx.active_object
+        mod = find_mod(src)
         others = [o for o in ctx.selected_objects if o is not src and o.type == "MESH"]
-        if len(others) != 1:
+        if len(others) > 1 or (not others and not mod_target(mod)):
             self.report({"ERROR"}, "Select the target mesh, then shift-select the object to blend (active)")
             return {"CANCELLED"}
-        tgt = others[0]
+        tgt = others[0] if others else mod_target(mod)
+        if tgt is src:
+            self.report({"ERROR"}, "The blend object cannot be its own target")
+            return {"CANCELLED"}
         ng = build_group()
-        mod = src.modifiers.new(GROUP, "NODES")
-        mod.node_group = ng
-        mod[input_ids(ng)["Target"]] = tgt
+        if not mod:
+            mod = src.modifiers.new(GROUP, "NODES")
+            mod.node_group = ng
+        mod[input_ids(mod.node_group)["Target"]] = tgt
         src.update_tag()
         # The conformed ground is joined in as a copy, because a modifier on the target that
         # reads the source would be a depsgraph cycle. So the original has to stop drawing:
         # left visible it stays flat, cuts straight through the crater, and that intersection
         # is exactly the hard ring the blend is supposed to remove. Object Info still reads
         # hidden objects, so the copy keeps working.
-        hid = ""
-        if mod[input_ids(ng)["Displace Ground"]]:
-            tgt.hide_set(True)
-            tgt.hide_render = True
-            hid = f"; hid '{tgt.name}' (the joined copy replaces it)"
-        err = setup_material(src, tgt)
+        _sync_target_visibility(mod, ctx)
+        hid = f"; hid '{tgt.name}'" if mod[input_ids(mod.node_group)["Displace Ground"]] else ""
+        err = setup_material(src, tgt, refresh=True)
         self.report({"WARNING"} if err else {"INFO"},
                     f"Blending '{src.name}' into '{tgt.name}'"
                     + (f" (materials not mixed: {err})" if err else "") + hid)
         return {"FINISHED"}
 
 
+class CONTACTBLEND_OT_update(bpy.types.Operator):
+    """Refresh the target shader and synchronize visibility without resetting settings"""
+    bl_idname = "object.contact_blend_update"
+    bl_label = "Update Blend"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, ctx):
+        return mod_target(find_mod(ctx.active_object)) is not None
+
+    def execute(self, ctx):
+        src = ctx.active_object
+        mod = find_mod(src)
+        tgt = mod_target(mod)
+        if tgt is src:
+            self.report({"ERROR"}, "The blend object cannot be its own target")
+            return {"CANCELLED"}
+        build_group()
+        _sync_target_visibility(mod, ctx)
+        src.update_tag()
+        err = setup_material(src, tgt, refresh=True)
+        self.report({"WARNING"} if err else {"INFO"},
+                    f"Updated '{src.name}'" + (f" (materials unchanged: {err})" if err else ""))
+        return {"FINISHED"}
+
+
+class CONTACTBLEND_OT_remove(bpy.types.Operator):
+    """Remove the blend, preserving material edits and restoring recorded target visibility"""
+    bl_idname = "object.contact_blend_remove"
+    bl_label = "Remove Blend"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, ctx):
+        return find_mod(ctx.active_object) is not None
+
+    def execute(self, ctx):
+        src = ctx.active_object
+        mod = find_mod(src)
+        targets = [mod_target(mod), mod.get(HIDDEN_TARGET_KEY)]
+        src.modifiers.remove(mod)
+        # Older files may contain duplicate modifiers. Keep the material blend until
+        # the last modifier is removed, rather than breaking a remaining blend.
+        if not find_mod(src):
+            remove_material_blend(src)
+        for tgt in targets:
+            _restore_target(tgt)
+        _cleanup_texture_data()
+        src.update_tag()
+        self.report({"INFO"}, f"Removed blend from '{src.name}'; kept source material edits")
+        return {"FINISHED"}
+
+
 class CONTACTBLEND_OT_material(bpy.types.Operator):
-    """Wire the target's shader into the active object's material, mixed by 'blend'"""
+    """Refresh the target's shader in an isolated copy of the active source material"""
     bl_idname = "object.contact_blend_material"
     bl_label = "Blend Materials"
     bl_options = {"REGISTER", "UNDO"}
@@ -549,7 +937,7 @@ class CONTACTBLEND_OT_material(bpy.types.Operator):
         if not tgt:
             self.report({"ERROR"}, "Run Contact Blend first")
             return {"CANCELLED"}
-        err = setup_material(src, tgt)
+        err = setup_material(src, tgt, refresh=True)
         if err:
             self.report({"ERROR"}, err)
             return {"CANCELLED"}
@@ -568,9 +956,9 @@ class CONTACTBLEND_OT_hide_target(bpy.types.Operator):
         return target_leaks(find_mod(ctx.active_object)) is not None
 
     def execute(self, ctx):
-        tgt = target_leaks(find_mod(ctx.active_object))
-        tgt.hide_set(True)
-        tgt.hide_render = True
+        mod = find_mod(ctx.active_object)
+        tgt = target_leaks(mod)
+        _sync_target_visibility(mod, ctx)
         self.report({"INFO"}, f"'{tgt.name}' hidden from viewport and render")
         return {"FINISHED"}
 
@@ -610,12 +998,28 @@ class CONTACTBLEND_PT_panel(bpy.types.Panel):
         mod = find_mod(ctx.active_object)
         if not mod:
             return
+        row = col.row(align=True)
+        row.operator(CONTACTBLEND_OT_update.bl_idname, icon="FILE_REFRESH")
+        row.operator(CONTACTBLEND_OT_remove.bl_idname, icon="X")
         col.separator()
-        for name, ident in input_ids(mod.node_group).items():
-            if name != "Geometry":
-                col.prop(mod, f'["{ident}"]', text=name)
+        ids = input_ids(mod.node_group)
+        for label, names in (
+                ("Contact", ("Target", "Contact Distance", "Surface Offset", "Displace Ground",
+                             "Ground Conform", "Contact Subdivisions")),
+                ("Shading", ("Normal Blend Distance", "Material Blend Distance",
+                             "Match Target Textures", "Target UV Map")),
+                ("Ground Detail", ("Ground Detail", "Detail Image", "Detail UV Map", "Detail Midlevel"))):
+            box = col.box().column()
+            box.label(text=label)
+            for name in names:
+                box.prop(mod, f'["{ids[name]}"]', text=name)
         col.separator()
         col.operator(CONTACTBLEND_OT_material.bl_idname, icon="NODE_MATERIAL")
+        mat = ctx.active_object.active_material
+        if mat and mat.get("cb_texture_warnings"):
+            box = col.box().column()
+            for warning in mat["cb_texture_warnings"].splitlines():
+                box.label(text=warning, icon="ERROR")
 
         # This one only breaks the render, so it is invisible until it is too late: say so.
         leak = target_leaks(mod)
@@ -648,7 +1052,8 @@ class CONTACTBLEND_PT_panel(bpy.types.Panel):
             box.operator(CONTACTBLEND_OT_bump_only.bl_idname, icon="MOD_SMOOTH")
 
 
-_classes = (CONTACTBLEND_OT_add, CONTACTBLEND_OT_material, CONTACTBLEND_OT_hide_target,
+_classes = (CONTACTBLEND_OT_add, CONTACTBLEND_OT_update, CONTACTBLEND_OT_remove,
+            CONTACTBLEND_OT_material, CONTACTBLEND_OT_hide_target,
             CONTACTBLEND_OT_bump_only, CONTACTBLEND_PT_panel)
 
 
@@ -749,8 +1154,10 @@ def _selftest():
     floor = -rock.location.z
 
     def ground_polys(me):
-        gi = [m.name if m else "" for m in me.materials].index(gmat.name)
-        return [p for p in me.polygons if p.material_index == gi]
+        ground_material = mod[ids["Ground Material"]]
+        names = {gmat.name, ground_material.name if ground_material else ""}
+        gi = {i for i, mat in enumerate(me.materials) if mat and mat.name in names}
+        return [p for p in me.polygons if p.material_index in gi]
 
     def ground_co(me):
         idx = {i for p in ground_polys(me) for i in p.vertices}

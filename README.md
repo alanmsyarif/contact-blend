@@ -45,8 +45,57 @@ unchanged, so hand-wired shaders reading it still work.
 The object gets a Geometry Nodes modifier, the target's shader is mixed into the object's
 material, and the target is hidden from the viewport and the render.
 
+The active source material is copied into an **object-linked material slot** before mixing.
+Other objects sharing its material or mesh keep their original materials. Material blending
+currently affects the active source material slot and uses the target's active material.
+
+### Update or remove a blend
+
+- **Update Blend** refreshes the copied target shader and synchronizes target visibility while
+  keeping modifier settings and source shader edits. Use it after changing the target material,
+  changing the Target field, or toggling Displace Ground. Geometry follows the target automatically.
+- **Remove Blend** removes the modifier and reconnects the source shader. It keeps the isolated
+  material and your edits, removing generated nodes unless you have wired them into other parts
+  of the shader. It restores recorded target visibility after the last blend using that target
+  is removed. Visibility values you have manually changed are preserved.
+- Running **Contact Blend** again reuses the existing modifier. With only the source selected,
+  it updates the existing target; selecting a new target retargets the blend.
+
+Visibility records are saved in the `.blend` file, including the scene/view layers in which
+the add-on hid the target. For blends created before 1.2, original visibility is unknown and
+is left unchanged on removal unless it has since been recorded by this version. Untagged
+legacy shader nodes are left disconnected on removal because they may contain user edits.
+
 **The target needs vertices in the contact area.** Conforming is vertex-driven: a 4-vertex plane
 cannot crater. Either subdivide it or raise `Contact Subdivisions`.
+
+### Match the ground's textures
+
+**Match Target Textures** is enabled by default. The copied target shader uses the target's
+coordinates rather than the hero's UVs, origin, or bounding box:
+
+- **UV textures** sample the selected target UV map from the conformed ground onto the hero's
+  face corners. Your existing hero UV maps are preserved. The target's render UV map is selected
+  initially; use **Target UV Map** to choose another map.
+- **Object coordinates** use the target's transform. Explicit references to mapping objects,
+  such as empties, are preserved. Target translation, rotation, and scale remain live.
+- **Generated coordinates** use the target's texture space on both sides of the contact.
+  Click **Update Blend** after changing the target's mesh bounds or texture-space settings.
+
+Unconnected image textures, common procedural textures, Texture Coordinate and UV Map nodes,
+and tangent-space Normal Map UV references are handled. Shared shader groups are copied before
+their internal coordinate nodes are adjusted. The joined ground gets a separate corrected
+material for the target's active material slot; the original target material is never edited.
+
+Click **Update Blend** after changing texture matching, the UV map, or the target shader.
+Existing blends need one update to refresh their copied shaders for this feature.
+
+Only one target UV map is projected at a time. Additional explicit UV maps and instancer
+coordinates are left unchanged and reported in the sidebar. A missing selected UV map also
+produces a warning. UV sampling is per corner: UV seams, projection beyond the target's edge,
+or sharply curved contacts may need more hero vertices. `Contact Subdivisions` only increases
+ground resolution. Disable texture matching and update the blend to retain the original
+coordinate behavior for materials requiring a custom setup.
 
 ## Settings
 
@@ -64,8 +113,13 @@ cannot crater. Either subdivide it or raise `Contact Subdivisions`.
 | **Detail Midlevel** | 0.0 | Value that means "no displacement". Set **0.5** for a real height map; the 0 default makes an unset image a no-op. |
 | **Normal Blend Distance** | 0.2 m | Over what distance the object's shading normals rotate to match the ground's. |
 | **Material Blend Distance** | 0.3 m | Over what distance the object's material fades into the ground's. |
+| **Match Target Textures** | on | Match UV, Object, and Generated coordinates in the copied target shader. Click Update Blend after changing. |
+| **Target UV Map** | target's render UV | UV map to project onto the hero. Click Update Blend after changing. |
 
-**Buttons.** *Blend Materials* re-runs the shader mixing (idempotent). *Hide Target From Render*
+Controls are grouped into **Contact**, **Shading**, and **Ground Detail** in the sidebar.
+
+**Buttons.** *Blend Materials* refreshes the target shader without accumulating copies.
+*Hide Target From Render*
 and *Set Target To Bump Only* appear only when those hazards are actually present.
 
 ## How it works
@@ -113,7 +167,9 @@ is tearing, and the node group's version stamp.
 The add-on is self-testing it builds a scene, evaluates the modifier and asserts on the result:
 
 ```bash
-blender --background --python contact_blend.py
+blender --background --python-exit-code 1 --python contact_blend.py
+blender --background --python-exit-code 1 --python tests/test_workflow.py
+blender --background --python-exit-code 1 --python tests/test_textures.py
 ```
 
 ```
@@ -127,6 +183,25 @@ subdivided and its cut cannot tear, ground shading stays uniform, contact-zone d
 the island, materials mix idempotently, render-visibility and displacement hazards are detected, a
 stale node group upgrades in place without losing settings, and a file saved under the 1.0 name
 migrates without orphaning its modifier.
+
+The workflow regression suite also covers shared materials and linked meshes, identical source
+and target materials, repeated application and refresh, preservation of user shader edits,
+retargeting, per-view-layer visibility restoration, several blends sharing a target, legacy
+removal, and saving/reloading a blend before updating and removing it.
+
+The texture suite checks transformed targets, UV sampling after ground conforming, preservation
+of source coordinates, private shader groups, refresh cleanup, and disabled matching. It also
+compares small CPU Cycles renders against the original target pattern for UV, Object, and
+Generated mapping.
+
+For a headless environment with the official `bpy` package installed, the same checks can run
+directly with that Python interpreter:
+
+```bash
+python -B contact_blend.py
+python -B tests/test_workflow.py
+python -B tests/test_textures.py
+```
 
 ## License
 
