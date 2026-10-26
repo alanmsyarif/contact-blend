@@ -115,11 +115,18 @@ def report(obj):
         add(f"attribute '{ATTR}': MISSING from the evaluated mesh")
     add(f"evaluated mesh   : {len(me.vertices)} verts, {len(me.materials)} material slots "
         f"({', '.join(m.name if m else '-' for m in me.materials)})")
+    if "Match Target Textures" in ids:
+        matching = mod.get(ids["Match Target Textures"], True)
+        add(f"texture matching : {matching}  target UV={mod.get(ids['Target UV Map'], '')!r}")
+        if matching:
+            add("projected UVs    : " + ("present" if "cb_target_uv" in me.uv_layers else "MISSING"))
 
     mat = obj.active_material
     if not mat or not mat.use_nodes:
         add("material         : none, or not using nodes")
     else:
+        for warning in mat.get("cb_texture_warnings", "").splitlines():
+            add(f"  ^-- {warning}")
         mix = next((n for n in (mat.node_tree.nodes.get(x) for x in NAMES) if n), None)
         add(f"material         : {mat.name}  mix node={'present' if mix else 'MISSING'}")
         if not mix:
@@ -139,6 +146,9 @@ def report(obj):
     #    background the moment one of them moves.
     add("")
     gmats = {m.name for m in (tgt.data.materials if tgt and tgt.data else []) if m}
+    mapped_ground = mod.get(ids["Ground Material"]) if "Ground Material" in ids else None
+    if mapped_ground:
+        gmats.add(mapped_ground.name)
     gi = {i for i, m in enumerate(me.materials) if m and m.name in gmats}
     gpolys = [p for p in me.polygons if p.material_index in gi]
     if not gpolys:
