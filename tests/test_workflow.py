@@ -72,13 +72,13 @@ class WorkflowTests(unittest.TestCase):
     def test_repeated_apply_updates_one_modifier(self):
         mod = self.apply()
         ids = cb.input_ids(mod.node_group)
-        mod[ids["Contact Distance"]] = 0.75
+        cb.modifier_values(mod)[ids["Contact Distance"]] = 0.75
         count = len(self.source.active_material.node_tree.nodes)
         for _ in range(3):
             self.activate(self.source)  # the existing target is hidden
             self.assertEqual(bpy.ops.object.contact_blend(), {"FINISHED"})
         self.assertEqual(len(self.source.modifiers), 1)
-        self.assertAlmostEqual(mod[ids["Contact Distance"]], 0.75)
+        self.assertAlmostEqual(cb.modifier_values(mod)[ids["Contact Distance"]], 0.75)
         self.assertEqual(len(self.source.active_material.node_tree.nodes), count)
 
     def test_refresh_changes_target_shader_and_keeps_source_edits(self):
@@ -161,7 +161,7 @@ class WorkflowTests(unittest.TestCase):
         mod = self.apply()
         other = self.mesh("New ground", (0, 1, 0, 1))
         self.activate(self.source)
-        mod[cb.input_ids(mod.node_group)["Target"]] = other
+        cb.modifier_values(mod)[cb.input_ids(mod.node_group)["Target"]] = other
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertFalse(self.target.hide_get())
         self.assertFalse(self.target.hide_render)
@@ -172,11 +172,11 @@ class WorkflowTests(unittest.TestCase):
 
     def test_disabling_ground_restores_target(self):
         mod = self.apply()
-        mod[cb.input_ids(mod.node_group)["Displace Ground"]] = False
+        cb.modifier_values(mod)[cb.input_ids(mod.node_group)["Displace Ground"]] = False
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertFalse(self.target.hide_get())
         self.assertFalse(self.target.hide_render)
-        mod[cb.input_ids(mod.node_group)["Displace Ground"]] = True
+        cb.modifier_values(mod)[cb.input_ids(mod.node_group)["Displace Ground"]] = True
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertTrue(self.target.hide_get())
         self.assertTrue(self.target.hide_render)
@@ -186,7 +186,7 @@ class WorkflowTests(unittest.TestCase):
         other = self.mesh("Other rock", (0, 1, 0, 1))
         mod = other.modifiers.new(cb.GROUP, "NODES")
         mod.node_group = cb.build_group()
-        mod[cb.input_ids(mod.node_group)["Target"]] = self.target
+        cb.modifier_values(mod)[cb.input_ids(mod.node_group)["Target"]] = self.target
         self.activate(other)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.activate(self.source)
@@ -226,7 +226,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_remove_after_target_socket_is_cleared(self):
         mod = self.apply()
-        mod[cb.input_ids(mod.node_group)["Target"]] = None
+        cb.modifier_values(mod)[cb.input_ids(mod.node_group)["Target"]] = None
         self.assertEqual(bpy.ops.object.contact_blend_remove(), {"FINISHED"})
         self.assertFalse(self.target.hide_get())
         self.assertFalse(self.target.hide_render)

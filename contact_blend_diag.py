@@ -25,6 +25,14 @@ def group_version(ng):
     return next((ng[k] for k in VERSION_KEYS if k in ng), None)
 
 
+def input_value(mod, identifier, default=None):
+    """Read legacy modifier properties or Blender 5.2's typed input values."""
+    if hasattr(mod, "properties"):
+        socket = getattr(mod.properties.inputs, identifier, None)
+        return socket.value if socket is not None and hasattr(socket, "value") else default
+    return mod.get(identifier, default)
+
+
 def report(obj):
     out = []
     add = out.append
@@ -34,7 +42,7 @@ def report(obj):
 
     ids = {i.name: i.identifier for i in mod.node_group.interface.items_tree
            if i.item_type == "SOCKET" and i.in_out == "INPUT"}
-    tgt = mod[ids["Target"]]
+    tgt = input_value(mod, ids["Target"])
     add(f"object   : {obj.name}")
     add(f"target   : {tgt.name if tgt else 'NONE  <-- modifier has no target'}")
     add(f"engine   : {bpy.context.scene.render.engine}")
@@ -64,7 +72,7 @@ def report(obj):
     #    viewport while the render still draws the original surface through the crater.
     add("")
     if tgt:
-        ground_on = mod[ids["Displace Ground"]]
+        ground_on = input_value(mod, ids["Displace Ground"])
         add(f"target visibility: eye_hidden={tgt.hide_get()} hide_render={tgt.hide_render} "
             f"hide_viewport={tgt.hide_viewport}")
         add(f"Displace Ground  : {ground_on}")
@@ -95,7 +103,7 @@ def report(obj):
         if linked and method != "BUMP":
             add("  ^-- THIS MOVES THE GROUND AT RENDER TIME, BEHIND THE MODIFIER'S BACK.")
             add(f"      Compare its Scale against Contact Distance"
-                f" ({mod[ids['Contact Distance']]:.4f}); if it is larger, the blend is swamped.")
+                f" ({input_value(mod, ids['Contact Distance']):.4f}); if it is larger, the blend is swamped.")
             add("      Fix: rebuild the height as Subdivision + Displace modifiers on the")
             add("      target, above Contact Blend, and set this material to Bump Only.")
 
@@ -110,14 +118,14 @@ def report(obj):
         add(f"attribute '{ATTR}': present  domain={a.domain} range={min(vals):.3f}..{max(vals):.3f}")
         if max(vals) < 0.5:
             add(f"  ^-- never gets near 1. Material Blend Distance"
-                f" ({mod[ids['Material Blend Distance']]:.4f}) is too small for this object.")
+                f" ({input_value(mod, ids['Material Blend Distance']):.4f}) is too small for this object.")
     else:
         add(f"attribute '{ATTR}': MISSING from the evaluated mesh")
     add(f"evaluated mesh   : {len(me.vertices)} verts, {len(me.materials)} material slots "
         f"({', '.join(m.name if m else '-' for m in me.materials)})")
     if "Match Target Textures" in ids:
-        matching = mod.get(ids["Match Target Textures"], True)
-        add(f"texture matching : {matching}  target UV={mod.get(ids['Target UV Map'], '')!r}")
+        matching = input_value(mod, ids["Match Target Textures"], True)
+        add(f"texture matching : {matching}  target UV={input_value(mod, ids['Target UV Map'], '')!r}")
         if matching:
             add("projected UVs    : " + ("present" if "cb_target_uv" in me.uv_layers else "MISSING"))
 
@@ -146,7 +154,7 @@ def report(obj):
     #    background the moment one of them moves.
     add("")
     gmats = {m.name for m in (tgt.data.materials if tgt and tgt.data else []) if m}
-    mapped_ground = mod.get(ids["Ground Material"]) if "Ground Material" in ids else None
+    mapped_ground = input_value(mod, ids["Ground Material"]) if "Ground Material" in ids else None
     if mapped_ground:
         gmats.add(mapped_ground.name)
     gi = {i for i, m in enumerate(me.materials) if m and m.name in gmats}

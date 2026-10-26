@@ -42,7 +42,7 @@ class TextureTests(unittest.TestCase):
         self.assertEqual(bpy.ops.object.contact_blend(), {"FINISHED"})
         mod = cb.find_mod(self.source)
         ids = cb.input_ids(mod.node_group)
-        mod[ids["Displace Ground"]] = ground
+        cb.modifier_values(mod)[ids["Displace Ground"]] = ground
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         return mod, ids
 
@@ -90,7 +90,7 @@ class TextureTests(unittest.TestCase):
         mesh = evaluated.to_mesh()
         try:
             mesh.calc_loop_triangles()
-            ground = mod[ids["Ground Material"]]
+            ground = cb.modifier_values(mod)[ids["Ground Material"]]
             triangles = [tri for tri in mesh.loop_triangles
                          if mesh.materials[tri.material_index].name == ground.name]
             bvh = BVHTree.FromPolygons([v.co for v in mesh.vertices],
@@ -145,7 +145,7 @@ class TextureTests(unittest.TestCase):
         tree.links.new(coord.outputs["Object"], noise.inputs["Vector"])
         mod, ids = self.apply(ground=True)
         self.assertEqual(self.copied_nodes("TEX_COORD")[0].object, self.target)
-        ground = mod[ids["Ground Material"]]
+        ground = cb.modifier_values(mod)[ids["Ground Material"]]
         self.assertNotEqual(ground, self.target.active_material)
         self.assertEqual(ground.node_tree.nodes[coord.name].object, self.target)
         self.assertIsNone(coord.object)
@@ -186,10 +186,10 @@ class TextureTests(unittest.TestCase):
     def test_texture_matching_can_be_disabled(self):
         self.target.active_material.node_tree.nodes.new("ShaderNodeTexImage")
         mod, ids = self.apply()
-        mod[ids["Match Target Textures"]] = False
+        cb.modifier_values(mod)[ids["Match Target Textures"]] = False
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertFalse(self.copied_nodes("TEX_IMAGE")[0].inputs["Vector"].is_linked)
-        self.assertEqual(mod[ids["Ground Material"]], self.target.active_material)
+        self.assertEqual(cb.modifier_values(mod)[ids["Ground Material"]], self.target.active_material)
         evaluated = self.source.evaluated_get(bpy.context.evaluated_depsgraph_get())
         mesh = evaluated.to_mesh()
         try:
@@ -204,7 +204,7 @@ class TextureTests(unittest.TestCase):
         tree.nodes.new("ShaderNodeTexImage")
         mod, ids = self.apply()
         self.assertIn("SecondaryUV", self.source.active_material["cb_texture_warnings"])
-        mod[ids["Target UV Map"]] = "MissingUV"
+        cb.modifier_values(mod)[ids["Target UV Map"]] = "MissingUV"
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertIn("UV map is missing", self.source.active_material["cb_texture_warnings"])
 

@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Contact Blend",
     "author": "amsy",
-    "version": (1, 3),
+    "version": (1, 3, 1),
     "blender": (4, 5, 0),
     "location": "Object > Contact Blend",
     "description": "Boolean-free blend of one mesh into another: the ground conforms to the object, plus custom normal weld and a 'blend' attribute for material mixing",
@@ -38,6 +38,111 @@ VISIBILITY_KEY = "cb_original_visibility"
 HIDDEN_TARGET_KEY = "cb_hidden_target"
 TARGET_UV_ATTR = "cb_target_uv"
 TEXTURE_DATA_KEY = "cb_texture_data"
+MODIFIER_STATE_KEY = "cb_modifier_state"
+
+
+class _ModifierValues:
+    """Blender 5.2 exposes node inputs as RNA values instead of modifier ID properties.
+
+    Keep add-on bookkeeping on the owning object, keyed by the modifier's persistent UID.
+    Reading this adapter never creates properties, so operator polls stay read-only.
+    """
+    def __init__(self, mod):
+        self.mod = mod
+
+    def _input(self, key):
+        socket = getattr(self.mod.properties.inputs, key, None)
+        return socket if socket is not None and hasattr(socket, "value") else None
+
+    def _state(self, create=False):
+        obj = self.mod.id_data
+        key = str(self.mod.persistent_uid)
+        if create:
+            if MODIFIER_STATE_KEY not in obj:
+                obj[MODIFIER_STATE_KEY] = {}
+            if key not in obj[MODIFIER_STATE_KEY]:
+                obj[MODIFIER_STATE_KEY][key] = {}
+        states = obj.get(MODIFIER_STATE_KEY)
+        return states.get(key) if states is not None else None
+
+    def __getitem__(self, key):
+        socket = self._input(key)
+        if socket is not None:
+            return socket.value
+        state = self._state()
+        if state is not None and key in state:
+            return state[key]
+        raise KeyError(key)
+
+    def __setitem__(self, key, value):
+        socket = self._input(key)
+        if socket is not None:
+            socket.value = value
+        else:
+            self._state(create=True)[key] = value
+
+    def __delitem__(self, key):
+        state = self._state()
+        if state is None or key not in state:
+            raise KeyError(key)
+        del state[key]
+
+    def __contains__(self, key):
+        if self._input(key) is not None:
+            return True
+        state = self._state()
+        return state is not None and key in state
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def modifier_values(mod):
+    """Return socket values and add-on metadata across supported Blender versions."""
+    return _ModifierValues(mod) if hasattr(mod, "properties") else mod
+
+
+def _draw_modifier_input(layout, mod, identifier, text):
+    if hasattr(mod, "properties"):
+        layout.prop(getattr(mod.properties.inputs, identifier), "value", text=text)
+    else:
+        layout.prop(mod, f'["{identifier}"]', text=text)
+
+
+def _input_options(mod, identifier):
+    if not hasattr(mod, "properties"):
+        return {suffix: mod[identifier + suffix]
+                for suffix in ("_use_attribute", "_attribute_name")
+                if identifier + suffix in mod}
+    socket = getattr(mod.properties.inputs, identifier, None)
+    return {name: getattr(socket, name) for name in ("type", "attribute_name", "layer_name")
+            if hasattr(socket, name)}
+
+
+def _restore_input_options(mod, identifier, options):
+    for name, value in options.items():
+        if hasattr(mod, "properties"):
+            setattr(getattr(mod.properties.inputs, identifier), name, value)
+        else:
+            mod[identifier + name] = value
+
+
+def _release_modifier_inputs(mod):
+    """Release typed ID references before 5.2 discards their dynamic RNA storage.
+
+    Blender 5.2.3 leaves their user counts incremented when a modifier or interface
+    socket is removed. Assigning None through the public input API releases them.
+    """
+    if not hasattr(mod, "properties") or not mod.node_group:
+        return
+    for identifier in input_ids(mod.node_group).values():
+        socket = getattr(mod.properties.inputs, identifier, None)
+        value_property = socket.bl_rna.properties.get("value") if socket else None
+        if value_property and value_property.type == "POINTER":
+            socket.value = None
 
 
 def _socket(ng, name, stype, in_out="INPUT", **kw):
@@ -123,8 +228,11 @@ def _rebuild(ng):
     """
     old = input_ids(ng)
     saved = [(obj.name, mod.name,
-              {n: mod[i] for n, i in old.items() if n != "Geometry" and i in mod})
+              {n: (modifier_values(mod)[i], _input_options(mod, i))
+               for n, i in old.items() if n != "Geometry" and i in modifier_values(mod)})
              for obj, mod in _users(ng)]
+    for _, mod in _users(ng):
+        _release_modifier_inputs(mod)
     ng.nodes.clear()
     ng.interface.clear()
     _build_group(ng)
@@ -132,10 +240,11 @@ def _rebuild(ng):
     new = input_ids(ng)
     for obj_name, mod_name, vals in saved:
         mod = bpy.data.objects[obj_name].modifiers.get(mod_name)
-        for name, v in vals.items():
+        for name, (v, options) in vals.items():
             if mod and name in new:
                 try:
-                    mod[new[name]] = v
+                    modifier_values(mod)[new[name]] = v
+                    _restore_input_options(mod, new[name], options)
                 except (TypeError, ValueError):
                     pass
         if mod:
@@ -561,11 +670,19 @@ def _texture_settings(src, tgt):
     if not mod:
         return True, uv_name, None
     ids = input_ids(mod.node_group)
-    if not mod.get("cb_uv_initialized") or mod.get("cb_uv_target") != tgt:
-        mod[ids["Target UV Map"]] = uv_name
-        mod["cb_uv_initialized"] = True
-        mod["cb_uv_target"] = tgt
-    return bool(mod[ids["Match Target Textures"]]), mod[ids["Target UV Map"]], mod
+    values = modifier_values(mod)
+    initialized = values.get("cb_uv_initialized")
+    current = values[ids["Target UV Map"]]
+    # Old .blend files can retain their socket values while Blender 5.2 discards the
+    # former modifier custom properties. Preserve a valid saved UV choice in that case.
+    if not initialized and current in tgt.data.uv_layers:
+        uv_name = current
+    elif initialized and values.get("cb_uv_target") == tgt:
+        uv_name = current
+    values[ids["Target UV Map"]] = uv_name
+    values["cb_uv_initialized"] = True
+    values["cb_uv_target"] = tgt
+    return bool(values[ids["Match Target Textures"]]), uv_name, mod
 
 
 def _material_mix(mat):
@@ -670,8 +787,8 @@ def setup_material(src, tgt, refresh=False):
             ground.use_fake_user = False
             ground[TEXTURE_DATA_KEY] = True
             _match_texture_nodes(ground.node_tree, tgt, uv_name, False)
-        mod[ids["Target Material"]] = tmat
-        mod[ids["Ground Material"]] = ground
+        modifier_values(mod)[ids["Target Material"]] = tmat
+        modifier_values(mod)[ids["Ground Material"]] = ground
     if mix_name:
         st.links.new(st.nodes[copy_name].outputs[tgt_idx], st.nodes[mix_name].inputs[2])
         _prune_generated(st, old_target_nodes)
@@ -738,7 +855,10 @@ def find_mod(obj):
 
 
 def mod_target(mod):
-    return mod[input_ids(mod.node_group)["Target"]] if mod and mod.node_group else None
+    if not mod or not mod.node_group:
+        return None
+    identifier = input_ids(mod.node_group).get("Target")
+    return modifier_values(mod).get(identifier) if identifier else None
 
 
 def _hide_target(tgt, ctx):
@@ -765,7 +885,7 @@ def _restore_target(tgt):
             if (mod.type == "NODES" and mod.node_group
                     and mod.node_group.name in (GROUP,) + LEGACY_NAMES
                     and mod_target(mod) == tgt
-                    and mod[input_ids(mod.node_group)["Displace Ground"]]):
+                    and modifier_values(mod)[input_ids(mod.node_group)["Displace Ground"]]):
                 return
     state = tgt[VISIBILITY_KEY]
     # A changed flag belongs to the user; restore only values still set by us.
@@ -781,14 +901,14 @@ def _restore_target(tgt):
 
 def _sync_target_visibility(mod, ctx):
     tgt = mod_target(mod)
-    old = mod.get(HIDDEN_TARGET_KEY)
-    ground_on = mod[input_ids(mod.node_group)["Displace Ground"]]
+    old = modifier_values(mod).get(HIDDEN_TARGET_KEY)
+    ground_on = modifier_values(mod)[input_ids(mod.node_group)["Displace Ground"]]
     if old and (old != tgt or not ground_on):
-        del mod[HIDDEN_TARGET_KEY]
+        del modifier_values(mod)[HIDDEN_TARGET_KEY]
         _restore_target(old)
     if tgt and ground_on:
         _hide_target(tgt, ctx)
-        mod[HIDDEN_TARGET_KEY] = tgt
+        modifier_values(mod)[HIDDEN_TARGET_KEY] = tgt
 
 
 def target_leaks(mod):
@@ -800,7 +920,7 @@ def target_leaks(mod):
     objects under both EEVEE and Cycles, so there is no cost to hiding it from both.
     """
     tgt = mod_target(mod)
-    if not tgt or not mod[input_ids(mod.node_group)["Displace Ground"]]:
+    if not tgt or not modifier_values(mod)[input_ids(mod.node_group)["Displace Ground"]]:
         return None
     return tgt if (not tgt.hide_render or not tgt.hide_get()) else None
 
@@ -852,7 +972,8 @@ class CONTACTBLEND_OT_add(bpy.types.Operator):
         if not mod:
             mod = src.modifiers.new(GROUP, "NODES")
             mod.node_group = ng
-        mod[input_ids(mod.node_group)["Target"]] = tgt
+            modifier_values(mod)[input_ids(ng)["Target UV Map"]] = _target_uv_name(tgt)
+        modifier_values(mod)[input_ids(mod.node_group)["Target"]] = tgt
         src.update_tag()
         # The conformed ground is joined in as a copy, because a modifier on the target that
         # reads the source would be a depsgraph cycle. So the original has to stop drawing:
@@ -860,7 +981,7 @@ class CONTACTBLEND_OT_add(bpy.types.Operator):
         # is exactly the hard ring the blend is supposed to remove. Object Info still reads
         # hidden objects, so the copy keeps working.
         _sync_target_visibility(mod, ctx)
-        hid = f"; hid '{tgt.name}'" if mod[input_ids(mod.node_group)["Displace Ground"]] else ""
+        hid = f"; hid '{tgt.name}'" if modifier_values(mod)[input_ids(mod.node_group)["Displace Ground"]] else ""
         err = setup_material(src, tgt, refresh=True)
         self.report({"WARNING"} if err else {"INFO"},
                     f"Blending '{src.name}' into '{tgt.name}'"
@@ -907,8 +1028,16 @@ class CONTACTBLEND_OT_remove(bpy.types.Operator):
     def execute(self, ctx):
         src = ctx.active_object
         mod = find_mod(src)
-        targets = [mod_target(mod), mod.get(HIDDEN_TARGET_KEY)]
+        targets = [mod_target(mod), modifier_values(mod).get(HIDDEN_TARGET_KEY)]
+        state_key = str(mod.persistent_uid)
+        _release_modifier_inputs(mod)
         src.modifiers.remove(mod)
+        states = src.get(MODIFIER_STATE_KEY)
+        if states is not None:
+            if state_key in states:
+                del states[state_key]
+            if not states:
+                del src[MODIFIER_STATE_KEY]
         # Older files may contain duplicate modifiers. Keep the material blend until
         # the last modifier is removed, rather than breaking a remaining blend.
         if not find_mod(src):
@@ -1012,7 +1141,7 @@ class CONTACTBLEND_PT_panel(bpy.types.Panel):
             box = col.box().column()
             box.label(text=label)
             for name in names:
-                box.prop(mod, f'["{ids[name]}"]', text=name)
+                _draw_modifier_input(box, mod, ids[name], name)
         col.separator()
         col.operator(CONTACTBLEND_OT_material.bl_idname, icon="NODE_MATERIAL")
         mat = ctx.active_object.active_material
@@ -1033,12 +1162,12 @@ class CONTACTBLEND_PT_panel(bpy.types.Panel):
         # Displace Ground ticked but Ground Conform at zero is a contradiction: the ground copy
         # is built and joined, costing everything it costs, and then multiplied out to nothing.
         ids = input_ids(mod.node_group)
-        if mod[ids["Displace Ground"]] and mod[ids["Ground Conform"]] < 0.01:
+        if modifier_values(mod)[ids["Displace Ground"]] and modifier_values(mod)[ids["Ground Conform"]] < 0.01:
             box = col.box().column(align=True)
             box.alert = True
             box.label(text="Ground Conform is ~0", icon="ERROR")
             box.label(text="Ground cannot move; no blend.")
-            box.prop(mod, f'["{ids["Ground Conform"]}"]', text="Ground Conform")
+            _draw_modifier_input(box, mod, ids["Ground Conform"], "Ground Conform")
 
         # Material displacement is applied after the modifier stack, so nothing here can see
         # or compensate for it. Silent in the viewport, ruinous at render.
@@ -1125,13 +1254,13 @@ def _selftest():
     assert bpy.ops.object.contact_blend() == {"FINISHED"}
     mod = rock.modifiers[-1]
     ids = input_ids(mod.node_group)
-    mod[ids["Surface Offset"]] = 0.01
+    modifier_values(mod)[ids["Surface Offset"]] = 0.01
 
     def ev_mesh():
         rock.update_tag()
         return rock.evaluated_get(bpy.context.evaluated_depsgraph_get()).to_mesh()
 
-    mod[ids["Displace Ground"]] = False
+    modifier_values(mod)[ids["Displace Ground"]] = False
     me = ev_mesh()
     assert len(me.vertices) == len(base), (len(me.vertices), len(base))
     moved = max((v.co - b).length for v, b in zip(me.vertices, base))
@@ -1146,7 +1275,7 @@ def _selftest():
     bent = sum(1 for a, b in zip(base_n, ev_n) if a != b)
     assert 0 < bent < len(base_n), f"{bent}/{len(base_n)} corners bent (want partial)"
 
-    mod[ids["Displace Ground"]] = True
+    modifier_values(mod)[ids["Displace Ground"]] = True
     gbase = [v.co.copy() for v in ground.data.vertices]
     # Object Info is RELATIVE, so the copy arrives in the rock's local space, where the flat
     # plane sits at -location.z. Subdivision breaks any 1:1 vertex correspondence with the
@@ -1154,7 +1283,7 @@ def _selftest():
     floor = -rock.location.z
 
     def ground_polys(me):
-        ground_material = mod[ids["Ground Material"]]
+        ground_material = modifier_values(mod)[ids["Ground Material"]]
         names = {gmat.name, ground_material.name if ground_material else ""}
         gi = {i for i, mat in enumerate(me.materials) if mat and mat.name in names}
         return [p for p in me.polygons if p.material_index in gi]
@@ -1174,12 +1303,12 @@ def _selftest():
         return {i for e, c in seen.items() if c == 1 for i in e
                 if abs(me.vertices[i].co.x) < rim and abs(me.vertices[i].co.y) < rim}
 
-    mod[ids["Contact Subdivisions"]] = 0
+    modifier_values(mod)[ids["Contact Subdivisions"]] = 0
     me = ev_mesh()
     assert len(me.vertices) == len(base) + len(gbase), len(me.vertices)
     coarse = len(ground_co(me))
 
-    mod[ids["Contact Subdivisions"]] = 2
+    modifier_values(mod)[ids["Contact Subdivisions"]] = 2
     me = ev_mesh()
     gco = ground_co(me)
     assert len(gco) > coarse * 1.5, f"contact zone not subdivided ({coarse} -> {len(gco)})"
@@ -1229,10 +1358,10 @@ def _selftest():
     assert target_leaks(mod) is ground, "eye-hidden but render-visible went undetected"
     assert bpy.ops.object.contact_blend_hide_target() == {"FINISHED"}
     assert ground.hide_render and target_leaks(mod) is None, "fix button did not fix it"
-    mod[ids["Displace Ground"]] = False              # no copy joined, target must stay visible
+    modifier_values(mod)[ids["Displace Ground"]] = False              # no copy joined, target must stay visible
     ground.hide_render = False
     assert target_leaks(mod) is None, "warned about a visible target with no ground copy"
-    mod[ids["Displace Ground"]] = True
+    modifier_values(mod)[ids["Displace Ground"]] = True
 
     # material displacement moves the target after the modifier stack, where nothing in this
     # node group can see it -- the blend is computed against a surface that is no longer there
@@ -1251,7 +1380,7 @@ def _selftest():
     # rather than quietly running the tree the .blend was first built with
     ng = mod.node_group
     assert group_version(ng) == GROUP_VERSION, group_version(ng)
-    mod[ids["Contact Distance"]] = 0.1234
+    modifier_values(mod)[ids["Contact Distance"]] = 0.1234
     ng[VERSION_KEY] = 0                              # pretend the file predates this build
     n_nodes = len(ng.nodes)
     ng2 = build_group()
@@ -1259,10 +1388,10 @@ def _selftest():
     assert group_version(ng) == GROUP_VERSION, "version stamp not updated"
     assert len(ng.nodes) == n_nodes, (len(ng.nodes), n_nodes)
     ids = input_ids(ng)
-    assert abs(mod[ids["Contact Distance"]] - 0.1234) < 1e-6, "settings lost across rebuild"
-    assert mod[ids["Target"]] == ground, "target lost across rebuild"
+    assert abs(modifier_values(mod)[ids["Contact Distance"]] - 0.1234) < 1e-6, "settings lost across rebuild"
+    assert modifier_values(mod)[ids["Target"]] == ground, "target lost across rebuild"
     assert build_group() is ng and len(ng.nodes) == n_nodes, "rebuilt again when up to date"
-    mod[ids["Contact Distance"]] = 0.3
+    modifier_values(mod)[ids["Contact Distance"]] = 0.3
 
     # --- a .blend saved under the pre-1.1 name must migrate, not orphan ---
     # Put the file back the way an old release left it: group and mix node under the old name,
@@ -1299,8 +1428,8 @@ def _selftest():
     img = bpy.data.images.new("height", 8, 8)
     img.pixels = [1.0] * (8 * 8 * 4)
     flat = [v.co.copy() for v in ev_mesh().vertices]
-    mod[ids["Detail Image"]] = img
-    mod[ids["Ground Detail"]] = 0.25
+    modifier_values(mod)[ids["Detail Image"]] = img
+    modifier_values(mod)[ids["Ground Detail"]] = 0.25
     me = ev_mesh()
     assert len(me.vertices) == len(flat), "detail changed the topology"
     moved_by = [(v.co - b).length for v, b in zip(me.vertices, flat)]
@@ -1316,7 +1445,7 @@ def _selftest():
     assert max(abs(me.vertices[i].co.z - floor) for i in tj2) < 1e-6, \
         "contact-zone detail tore the subdivision cut"
     detail_max = max(moved_by)
-    mod[ids["Ground Detail"]] = 0.0
+    modifier_values(mod)[ids["Ground Detail"]] = 0.0
 
     unregister()
     print(f"OK  hero_moved={moved:.6f}  ground dip={dip:.4f} far={far:.6f} "

@@ -9,7 +9,7 @@ as a seam. Shading and materials are cross-faded across the same contact band.
 
 | | |
 |---|---|
-| **Blender** | 4.5 LTS, 5.0, 5.1 |
+| **Blender** | 4.5 LTS, 5.0, 5.1, 5.2 LTS |
 | **Location** | `View3D > Sidebar (N) > Contact`, and `Object > Contact Blend` |
 | **Renderers** | EEVEE Next and Cycles |
 
@@ -155,6 +155,11 @@ why each ordering is the way it is.
 
 ## Troubleshooting
 
+**Blender 5.2: `TypeError: this type doesn't support IDProperties`.** Install version 1.3.1
+or later of `contact_blend.py` and restart Blender to reload the add-on. Blender 5.2 moved
+Geometry Nodes modifier inputs to a typed API; this version handles both the new API and
+the older modifier properties. Existing node groups and socket settings can be kept.
+
 Run `contact_blend_diag.py` from Blender's Text Editor with the blended object selected. It writes
 a report to a Text datablock named **`Contact Blend Report`**, and checks the things that break
 only at render time or only silently: per-modifier render toggles, mismatched subdivision levels,
@@ -170,6 +175,7 @@ The add-on is self-testing it builds a scene, evaluates the modifier and asserts
 blender --background --python-exit-code 1 --python contact_blend.py
 blender --background --python-exit-code 1 --python tests/test_workflow.py
 blender --background --python-exit-code 1 --python tests/test_textures.py
+blender --background --python-exit-code 1 --python tests/test_compatibility.py
 ```
 
 ```
@@ -194,6 +200,10 @@ of source coordinates, private shader groups, refresh cleanup, and disabled matc
 compares small CPU Cycles renders against the original target pattern for UV, Object, and
 Generated mapping.
 
+The compatibility suite covers modifier input reads/writes and operator polling across the
+legacy and Blender 5.2 APIs, bookkeeping after renaming/removing modifiers, saved UV choices,
+and preservation of field modes and material references during node-group upgrades.
+
 For a headless environment with the official `bpy` package installed, the same checks can run
 directly with that Python interpreter:
 
@@ -201,6 +211,7 @@ directly with that Python interpreter:
 python -B contact_blend.py
 python -B tests/test_workflow.py
 python -B tests/test_textures.py
+python -B tests/test_compatibility.py
 ```
 
 ## License
