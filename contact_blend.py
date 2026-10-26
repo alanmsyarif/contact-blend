@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Contact Blend",
     "author": "amsy",
-    "version": (1, 3, 1),
+    "version": (1, 4, 0),
     "blender": (4, 5, 0),
     "location": "Object > Contact Blend",
     "description": "Boolean-free blend of one mesh into another: the ground conforms to the object, plus custom normal weld and a 'blend' attribute for material mixing",
@@ -12,6 +12,7 @@ bl_info = {
 }
 
 import bpy
+import textwrap
 
 GROUP = "Contact Blend"
 ATTR = "blend"
@@ -26,7 +27,7 @@ LEGACY_NAMES = ("Blend To Surface",)
 # number, so an existing .blend picks up fixes on reload instead of silently running the tree
 # it was first built with -- a stale group is indistinguishable from a bug that did not get
 # fixed, and telling people to delete it by hand is exactly how it survives.
-GROUP_VERSION = 6
+GROUP_VERSION = 7
 # The stamp moved with the rename. An old group carries the value under the old key, so read
 # both and rewrite to the current one -- treating the old key as unstamped would force a
 # needless rebuild, and the diagnostic would report a group of unknown vintage.
@@ -105,11 +106,15 @@ def modifier_values(mod):
     return _ModifierValues(mod) if hasattr(mod, "properties") else mod
 
 
-def _draw_modifier_input(layout, mod, identifier, text):
+def _draw_modifier_input(layout, mod, identifier, text, search_data=None, search_property=None):
     if hasattr(mod, "properties"):
-        layout.prop(getattr(mod.properties.inputs, identifier), "value", text=text)
+        owner, path = getattr(mod.properties.inputs, identifier), "value"
     else:
-        layout.prop(mod, f'["{identifier}"]', text=text)
+        owner, path = mod, f'["{identifier}"]'
+    if search_data is not None and search_property:
+        layout.prop_search(owner, path, search_data, search_property, text=text)
+    else:
+        layout.prop(owner, path, text=text)
 
 
 def _input_options(mod, identifier):
@@ -146,7 +151,29 @@ def _release_modifier_inputs(mod):
 
 
 def _socket(ng, name, stype, in_out="INPUT", **kw):
-    s = ng.interface.new_socket(name=name, in_out=in_out, socket_type=stype)
+    # Reuse compatible interface sockets during upgrades. Their identifiers appear
+    # in animation paths, drivers, and links from any parent node groups.
+    s = next((item for item in ng.interface.items_tree
+              if item.item_type == "SOCKET" and item.name == name
+              and item.in_out == in_out and item.socket_type == stype), None)
+    if s is None:
+        s = ng.interface.new_socket(name=name, in_out=in_out, socket_type=stype)
+    descriptions = {
+        "Target": "Ground mesh to blend into. Click Update Blend after choosing a new target",
+        "Contact Distance": "Width of the contact effect in the object's local units",
+        "Contact Subdivisions": "Full / render subdivision level; each level makes four times as many contact faces",
+        "Viewport Subdivisions": "Lower subdivision level for interactive editing; never changes render quality",
+        "Use Viewport Quality": "Use a separate subdivision level in the viewport and retain full quality for rendering",
+        "Ground Conform": "Strength of the ground deformation. Zero leaves the ground unchanged",
+        "Surface Offset": "Small inset inside the hero mesh to prevent overlapping surfaces from flickering",
+        "Displace Ground": "Conform and join the ground. Off uses shading only; click Update Blend to restore target visibility",
+        "Match Target Textures": "Project target texture coordinates. Click Update Blend after changing this setting",
+        "Target UV Map": "Target UV layer to project onto the hero. Click Update Blend after changing the layer",
+        "Ground Detail": "Height of the image-based ground detail inside the contact zone",
+        "Detail Midlevel": "Neutral height in the detail image; use 0.5 for a centered height map",
+    }
+    if name in descriptions:
+        s.description = descriptions[name]
     for k, v in kw.items():
         setattr(s, k, v)
     return s
@@ -222,9 +249,9 @@ def migrate_names():
 def _rebuild(ng):
     """Rebuild `ng`'s tree in place at GROUP_VERSION, carrying modifier settings across.
 
-    In place keeps every existing modifier pointing at it. Socket identifiers are regenerated,
-    so settings are carried by socket *name*; anything renamed between versions falls back to
-    the new default.
+    In place keeps every existing modifier pointing at it. Reuse compatible sockets so
+    keyframes, drivers and parent-group links retain their paths. Settings are restored
+    by socket name; newly added or renamed sockets receive their new defaults.
     """
     old = input_ids(ng)
     saved = [(obj.name, mod.name,
@@ -234,7 +261,6 @@ def _rebuild(ng):
     for _, mod in _users(ng):
         _release_modifier_inputs(mod)
     ng.nodes.clear()
-    ng.interface.clear()
     _build_group(ng)
     _stamp(ng)
     new = input_ids(ng)
@@ -280,6 +306,8 @@ def _build_group(ng):
     _socket(ng, "Displace Ground", "NodeSocketBool", default_value=True)
     _socket(ng, "Ground Conform", "NodeSocketFloat", default_value=1.0, min_value=0.0, max_value=1.0, subtype="FACTOR")
     _socket(ng, "Contact Subdivisions", "NodeSocketInt", default_value=2, min_value=0, max_value=5)
+    _socket(ng, "Viewport Subdivisions", "NodeSocketInt", default_value=2, min_value=0, max_value=5)
+    _socket(ng, "Use Viewport Quality", "NodeSocketBool", default_value=False)
     _socket(ng, "Ground Detail", "NodeSocketFloat", default_value=0.0, subtype="DISTANCE")
     _socket(ng, "Detail Image", "NodeSocketImage")
     _socket(ng, "Detail UV Map", "NodeSocketString", default_value="UVMap")
@@ -385,7 +413,17 @@ def _build_group(ng):
     link(movable.outputs[0], sep.inputs["Selection"])
     sub = _node(ng, "GeometryNodeSubdivideMesh", 300, -900)
     link(sep.outputs["Selection"], sub.inputs["Mesh"])
-    link(g["Contact Subdivisions"], sub.inputs["Level"])
+    # Keep the original subdivision setting for rendering. Viewport-only quality is
+    # opt-in, so upgrading an existing blend retains its established density.
+    viewport = _node(ng, "GeometryNodeIsViewport", -300, -1100)
+    preview = _node(ng, "FunctionNodeBooleanMath", -100, -1100, operation="AND")
+    link(viewport.outputs[0], preview.inputs[0])
+    link(g["Use Viewport Quality"], preview.inputs[1])
+    levels = _node(ng, "GeometryNodeSwitch", 100, -1100, input_type="INT")
+    link(preview.outputs[0], levels.inputs[0])
+    link(g["Contact Subdivisions"], levels.inputs[1])
+    link(g["Viewport Subdivisions"], levels.inputs[2])
+    link(levels.outputs["Output"], sub.inputs["Level"])
     dense = _node(ng, "GeometryNodeJoinGeometry", 500, -900)
     link(sep.outputs["Inverted"], dense.inputs["Geometry"])
     link(sub.outputs["Mesh"], dense.inputs["Geometry"])
@@ -486,8 +524,12 @@ def _build_group(ng):
 
     # --- weld the shading: near the target, adopt the target's normal ---
     mix = _node(ng, "ShaderNodeMix", 1100, -1000, data_type="VECTOR")
-    link(ramp(900, -1250, proximity(700, -1250, tgt)[0], g["Normal Blend Distance"], 0.0, 1.0), mix.inputs[0])
-    link(sample_normal(700, -1000, tgt), mix.inputs[4])
+    # Shading-only mode must sample the unchanged target. Sampling `tgt` here would
+    # evaluate the entire conform/subdivision branch even when its geometry is disabled,
+    # and let unused ground-detail settings change the hero's shading normals.
+    shading_target = uv_geo.outputs["Output"]
+    link(ramp(900, -1250, proximity(700, -1250, shading_target)[0], g["Normal Blend Distance"], 0.0, 1.0), mix.inputs[0])
+    link(sample_normal(700, -1000, shading_target), mix.inputs[4])
     link(nor.outputs["Normal"], mix.inputs[5])
 
     # CORNER, not POINT: `FREE` mode has no selection input, so the custom normal is
@@ -515,11 +557,53 @@ def _surface(mat):
 _SKIP_PROPS = {"rna_type", "name", "parent", "internal_links", "dimensions", "select", "location"}
 
 
-def _copy_nodes(src_tree, dst_tree, offset):
-    """Clone every non-output node of `src_tree` into `dst_tree`. Returns {old: new}."""
+def _upstream_node_names(tree, roots):
+    """Visit shader dependencies once, without inspecting RNA on unused nodes."""
+    incoming = {}
+    for link in tree.links:
+        incoming.setdefault(link.to_node.name, []).append(link.from_node.name)
+    names, pending = set(), list(roots)
+    while pending:
+        name = pending.pop()
+        if name in names:
+            continue
+        names.add(name)
+        pending.extend(incoming.get(name, ()))
+    # Frames are visual parents, not shader dependencies, but keep their hierarchy.
+    for name in tuple(names):
+        parent = tree.nodes[name].parent
+        while parent:
+            names.add(parent.name)
+            parent = parent.parent
+    return names
+
+
+def _output_node_names(tree):
+    # Keep every renderer-specific material output. For shader groups only the active
+    # group output is evaluated; inactive alternatives must not force recursive copies.
+    material = [n.name for n in tree.nodes if n.type == "OUTPUT_MATERIAL"]
+    if material:
+        return _upstream_node_names(tree, material)
+    outputs = [n for n in tree.nodes if n.type == "GROUP_OUTPUT"]
+    roots = [n.name for n in outputs if n.is_active_output] or [n.name for n in outputs]
+    return _upstream_node_names(tree, roots)
+
+
+def _group_output_node_names(tree, identifiers):
+    outputs = [n for n in tree.nodes if n.type == "GROUP_OUTPUT" and n.is_active_output]
+    if not outputs:
+        outputs = [n for n in tree.nodes if n.type == "GROUP_OUTPUT"]
+    root_names = {n.name for n in outputs}
+    roots = [link.from_node.name for link in tree.links
+             if link.to_node.name in root_names and link.to_socket.identifier in identifiers]
+    return _upstream_node_names(tree, roots) | root_names
+
+
+def _copy_nodes(src_tree, dst_tree, offset, node_names=None):
+    """Clone selected shader dependencies. Returns {old: new}, including visual frames."""
     m = {}
     for n in src_tree.nodes:
-        if n.type == "OUTPUT_MATERIAL":
+        if n.type == "OUTPUT_MATERIAL" or (node_names is not None and n.name not in node_names):
             continue
         c = dst_tree.nodes.new(n.bl_idname)
         for p in n.bl_rna.properties:
@@ -536,6 +620,10 @@ def _copy_nodes(src_tree, dst_tree, offset):
             except Exception:
                 pass
         m[n] = c
+    for original, copied in m.items():
+        if original.parent in m:
+            copied.parent = m[original.parent]
+            copied.location = original.location
     for l in src_tree.links:
         f, t = m.get(l.from_node), m.get(l.to_node)
         if not f or not t:
@@ -609,14 +697,20 @@ def _match_texture_nodes(tree, tgt, uv_name, project_uv, groups=None, node_names
         name, kind = original.name, original.type
         if kind == "GROUP" and original.node_tree:
             old = original.node_tree
-            if old not in groups:
+            identifiers = frozenset(link.from_socket.identifier for link in tree.links
+                                    if link.from_node.name == name
+                                    and (node_names is None or link.to_node.name in node_names))
+            key = (old, identifiers)
+            if key not in groups:
                 copied = old.copy()
                 copied.name = old.name + " (Contact Blend)"
                 copied.use_fake_user = False
                 copied[TEXTURE_DATA_KEY] = True
-                groups[old] = copied
-                warnings |= _match_texture_nodes(copied, tgt, uv_name, project_uv, groups)
-            tree.nodes[name].node_tree = groups[old]
+                groups[key] = copied
+                relevant = _group_output_node_names(copied, identifiers)
+                warnings |= _match_texture_nodes(copied, tgt, uv_name, project_uv, groups,
+                                                node_names=relevant)
+            tree.nodes[name].node_tree = groups[key]
         elif kind == "TEX_COORD":
             if original.from_instancer:
                 warnings.add("Instancer texture coordinates are not projected")
@@ -715,9 +809,12 @@ def _prune_generated(tree, names):
     """Delete owned nodes, retaining any branches the user has wired elsewhere."""
     keep = {l.from_node.name for l in tree.links
             if l.from_node.name in names and l.to_node.name not in names}
+    parents = {n.name: n.parent.name for n in tree.nodes if n.parent}
+    keep |= {parent for child, parent in parents.items() if child not in names and parent in names}
     while True:
         upstream = {l.from_node.name for l in tree.links
                     if l.to_node.name in keep and l.from_node.name in names}
+        upstream |= {parents[name] for name in keep if name in parents and parents[name] in names}
         if upstream <= keep:
             break
         keep |= upstream
@@ -768,7 +865,8 @@ def setup_material(src, tgt, refresh=False):
     old_target_nodes = {n.name for n in st.nodes if n.get(GENERATED_KEY) == "target"}
     mix_name = mix.name if mix else None
     offset = (sshader.node.location[0] - 600, sshader.node.location[1] - 900)
-    m = _copy_nodes(tmat.node_tree, st, offset)
+    surface_nodes = _upstream_node_names(tmat.node_tree, [tgt_name])
+    m = _copy_nodes(tmat.node_tree, st, offset, node_names=surface_nodes)
     for node in m.values():
         node[GENERATED_KEY] = "target"
     copy_name = m[tmat.node_tree.nodes[tgt_name]].name
@@ -782,17 +880,27 @@ def setup_material(src, tgt, refresh=False):
         ids = input_ids(mod.node_group)
         ground = tmat
         if match_textures:
-            ground = tmat.copy()
-            ground.name = tmat.name + " (Contact Blend Ground)"
-            ground.use_fake_user = False
-            ground[TEXTURE_DATA_KEY] = True
-            _match_texture_nodes(ground.node_tree, tgt, uv_name, False)
+            ground_nodes = _output_node_names(tmat.node_tree)
+            needs_coordinates = any(n.name in ground_nodes and n.type in {
+                "GROUP", "TEX_COORD", "UVMAP", "NORMAL_MAP", "TEX_IMAGE", "TEX_NOISE",
+                "TEX_VORONOI", "TEX_WAVE", "TEX_CHECKER", "TEX_BRICK", "TEX_GRADIENT",
+                "TEX_MAGIC", "TEX_WHITE_NOISE", "TEX_GABOR"} for n in tmat.node_tree.nodes)
+            if needs_coordinates:
+                ground = tmat.copy()
+                ground.name = tmat.name + " (Contact Blend Ground)"
+                ground.use_fake_user = False
+                ground[TEXTURE_DATA_KEY] = True
+                _match_texture_nodes(ground.node_tree, tgt, uv_name, False,
+                                     node_names=ground_nodes)
         modifier_values(mod)[ids["Target Material"]] = tmat
         modifier_values(mod)[ids["Ground Material"]] = ground
     if mix_name:
         st.links.new(st.nodes[copy_name].outputs[tgt_idx], st.nodes[mix_name].inputs[2])
         _prune_generated(st, old_target_nodes)
         _cleanup_texture_data()
+        if mod:
+            modifier_values(mod)["cb_applied_uv"] = uv_name
+            modifier_values(mod)["cb_applied_texture_match"] = match_textures
         return None
     base = tuple(st.nodes[out_name].location)
 
@@ -814,6 +922,9 @@ def setup_material(src, tgt, refresh=False):
     st.links.new(n[copy_name].outputs[tgt_idx], mix.inputs[2])  # blend=1: target shader
     st.links.new(mix.outputs[0], n[out_name].inputs["Surface"])
     _cleanup_texture_data()
+    if mod:
+        modifier_values(mod)["cb_applied_uv"] = uv_name
+        modifier_values(mod)["cb_applied_texture_match"] = match_textures
     return None
 
 
@@ -947,6 +1058,140 @@ def target_displaces(mod):
     return out
 
 
+def _editing_problem(ctx):
+    src = ctx.active_object
+    if src is None:
+        return "Select a mesh object to begin"
+    if src.type != "MESH":
+        return "The active object must be a mesh"
+    if getattr(ctx, "mode", getattr(src, "mode", "OBJECT")) != "OBJECT":
+        return "Switch to Object Mode to edit a blend"
+    if not src.is_editable:
+        return "Make the linked mesh object editable first"
+    return ""
+
+
+def _ui_context(ctx):
+    src = ctx.active_object
+    mod = find_mod(src) if src and src.type == "MESH" else None
+    ids = input_ids(mod.node_group) if mod else {}
+    values = modifier_values(mod) if mod else None
+    tgt = values.get(ids["Target"]) if "Target" in ids else None
+    return src, mod, tgt, ids, values
+
+
+def _ui_message(layout, text, ctx, icon="INFO"):
+    region = getattr(ctx, "region", None)
+    width = max(22, int(getattr(region, "width", 320) / 8))
+    for index, line in enumerate(textwrap.wrap(text, width=width) or [""]):
+        layout.label(text=line, icon=icon if index == 0 else "NONE")
+
+
+def _blend_issues(src, mod, ctx, detailed=True):
+    """Cheap status for redraws; shader-tree inspection only on explicit diagnosis."""
+    ids = input_ids(mod.node_group)
+    values = modifier_values(mod)
+    tgt = values.get(ids.get("Target", ""))
+    if not tgt:
+        return [("ERROR", "Choose a target mesh")]
+    if tgt is src or tgt.type != "MESH":
+        return [("ERROR", "Target must be a different mesh object")]
+    issues = []
+    ground_on = values.get(ids.get("Displace Ground", ""), True)
+    if not mod.show_viewport:
+        issues.append(("INFO", "Blend is paused in the viewport"))
+    if not mod.show_render:
+        issues.append(("WARNING", "Blend is disabled in the render"))
+    if ground_on and (not tgt.hide_render or not tgt.hide_get(view_layer=ctx.view_layer)):
+        issues.append(("WARNING", "Target is still visible; use Update Blend"))
+    if not ground_on and values.get(HIDDEN_TARGET_KEY):
+        issues.append(("INFO", "Update Blend to restore target visibility"))
+    if ground_on and values.get(ids.get("Ground Conform", ""), 1.0) < 0.01:
+        issues.append(("WARNING", "Ground Conform is zero; the ground cannot move"))
+    levels = values.get(ids.get("Contact Subdivisions", ""), 2)
+    if ground_on and levels >= 4:
+        issues.append(("WARNING", f"High subdivision: up to {4 ** levels:,} faces per contact face"))
+    matching = values.get(ids.get("Match Target Textures", ""), True)
+    uv_name = values.get(ids.get("Target UV Map", ""), "")
+    if matching and uv_name and uv_name not in tgt.data.uv_layers:
+        issues.append(("WARNING", "Target UV map is missing; choose an available layer"))
+    if (values.get("cb_uv_initialized") and
+            (values.get("cb_uv_target") != tgt
+             or values.get("cb_applied_uv", uv_name) != uv_name
+             or values.get("cb_applied_texture_match", matching) != matching)):
+        issues.append(("INFO", "Update Blend to apply target or texture changes"))
+    mat = src.active_material
+    if mat is None:
+        issues.append(("WARNING", "Add a source material to blend shaders"))
+    if tgt.active_material is None:
+        issues.append(("WARNING", "Add a target material to blend shaders"))
+    if mat:
+        issues.extend(("WARNING", text) for text in mat.get("cb_texture_warnings", "").splitlines())
+    if detailed:
+        if not _surface(mat)[1]:
+            issues.append(("WARNING", "Source material needs a connected Surface shader"))
+        if not _surface(tgt.active_material)[1]:
+            issues.append(("WARNING", "Target material needs a connected Surface shader"))
+        for material in target_displaces(mod):
+            issues.append(("WARNING", f"Target material '{material.name}' displaces during render"))
+        if ground_on and len(tgt.data.polygons) < 16:
+            issues.append(("INFO", "Coarse target mesh: add vertices near the contact if needed"))
+    return issues
+
+
+class CONTACTBLEND_OT_quality(bpy.types.Operator):
+    """Set interactive subdivision quality while keeping a separate render level"""
+    bl_idname = "object.contact_blend_quality"
+    bl_label = "Set Blend Quality"
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset: bpy.props.EnumProperty(items=(
+        ("DRAFT", "Draft", "No contact subdivisions while editing; render at level 2"),
+        ("BALANCED", "Balanced", "Level 1 while editing; render at level 2"),
+        ("FINAL", "Final", "Level 2 while editing; render at level 3")))
+
+    @classmethod
+    def poll(cls, ctx):
+        if _editing_problem(ctx):
+            return False
+        mod = find_mod(ctx.active_object)
+        return mod is not None and "Viewport Subdivisions" in input_ids(mod.node_group)
+
+    def execute(self, ctx):
+        mod = find_mod(ctx.active_object)
+        ids, values = input_ids(mod.node_group), modifier_values(mod)
+        viewport, render = {"DRAFT": (0, 2), "BALANCED": (1, 2), "FINAL": (2, 3)}[self.preset]
+        values[ids["Use Viewport Quality"]] = True
+        values[ids["Viewport Subdivisions"]] = viewport
+        values[ids["Contact Subdivisions"]] = render
+        ctx.active_object.update_tag()
+        return {"FINISHED"}
+
+
+class CONTACTBLEND_OT_diagnostics(bpy.types.Operator):
+    """Check blend settings without evaluating or rebuilding the mesh"""
+    bl_idname = "object.contact_blend_diagnostics"
+    bl_label = "Check Blend"
+
+    @classmethod
+    def poll(cls, ctx):
+        return find_mod(ctx.active_object) is not None
+
+    def execute(self, ctx):
+        src, mod, tgt, ids, values = _ui_context(ctx)
+        issues = _blend_issues(src, mod, ctx)
+        lines = ["Contact Blend Status", f"Object: {src.name}",
+                 f"Target: {tgt.name if tgt else 'Not set'}"]
+        lines.extend(f"{severity}: {message}" for severity, message in issues)
+        if not issues:
+            lines.append("OK: No settings hazards detected")
+        text = bpy.data.texts.get("Contact Blend Status") or bpy.data.texts.new("Contact Blend Status")
+        text.clear()
+        text.write("\n".join(lines))
+        self.report({"INFO"}, f"{len(issues)} notice(s). Read 'Contact Blend Status' in the Text Editor")
+        return {"FINISHED"}
+
+
 class CONTACTBLEND_OT_add(bpy.types.Operator):
     """Blend the active object into the other selected object without booleans"""
     bl_idname = "object.contact_blend"
@@ -955,7 +1200,14 @@ class CONTACTBLEND_OT_add(bpy.types.Operator):
 
     @classmethod
     def poll(cls, ctx):
-        return ctx.active_object is not None and ctx.active_object.type == "MESH"
+        problem = _editing_problem(ctx)
+        if problem:
+            cls.poll_message_set(problem)
+            return False
+        src = ctx.active_object
+        others = [o for o in ctx.selected_objects if o is not src and o.type == "MESH"]
+        tgt = others[0] if len(others) == 1 else mod_target(find_mod(src))
+        return len(others) <= 1 and tgt is not None and tgt.type == "MESH" and tgt is not src
 
     def execute(self, ctx):
         src = ctx.active_object
@@ -965,8 +1217,8 @@ class CONTACTBLEND_OT_add(bpy.types.Operator):
             self.report({"ERROR"}, "Select the target mesh, then shift-select the object to blend (active)")
             return {"CANCELLED"}
         tgt = others[0] if others else mod_target(mod)
-        if tgt is src:
-            self.report({"ERROR"}, "The blend object cannot be its own target")
+        if not tgt or tgt is src or tgt.type != "MESH":
+            self.report({"ERROR"}, "Target must be a different mesh object")
             return {"CANCELLED"}
         ng = build_group()
         if not mod:
@@ -997,14 +1249,17 @@ class CONTACTBLEND_OT_update(bpy.types.Operator):
 
     @classmethod
     def poll(cls, ctx):
-        return mod_target(find_mod(ctx.active_object)) is not None
+        if _editing_problem(ctx):
+            return False
+        tgt = mod_target(find_mod(ctx.active_object))
+        return tgt is not None and tgt.type == "MESH" and tgt is not ctx.active_object
 
     def execute(self, ctx):
         src = ctx.active_object
         mod = find_mod(src)
         tgt = mod_target(mod)
-        if tgt is src:
-            self.report({"ERROR"}, "The blend object cannot be its own target")
+        if not tgt or tgt is src or tgt.type != "MESH":
+            self.report({"ERROR"}, "Target must be a different mesh object")
             return {"CANCELLED"}
         build_group()
         _sync_target_visibility(mod, ctx)
@@ -1023,7 +1278,10 @@ class CONTACTBLEND_OT_remove(bpy.types.Operator):
 
     @classmethod
     def poll(cls, ctx):
-        return find_mod(ctx.active_object) is not None
+        return not _editing_problem(ctx) and find_mod(ctx.active_object) is not None
+
+    def invoke(self, ctx, event):
+        return ctx.window_manager.invoke_confirm(self, event)
 
     def execute(self, ctx):
         src = ctx.active_object
@@ -1058,13 +1316,13 @@ class CONTACTBLEND_OT_material(bpy.types.Operator):
 
     @classmethod
     def poll(cls, ctx):
-        return ctx.active_object is not None and ctx.active_object.type == "MESH"
+        return CONTACTBLEND_OT_update.poll(ctx)
 
     def execute(self, ctx):
         src = ctx.active_object
         tgt = mod_target(find_mod(src))
-        if not tgt:
-            self.report({"ERROR"}, "Run Contact Blend first")
+        if not tgt or tgt is src or tgt.type != "MESH":
+            self.report({"ERROR"}, "Choose a different target mesh first")
             return {"CANCELLED"}
         err = setup_material(src, tgt, refresh=True)
         if err:
@@ -1082,7 +1340,7 @@ class CONTACTBLEND_OT_hide_target(bpy.types.Operator):
 
     @classmethod
     def poll(cls, ctx):
-        return target_leaks(find_mod(ctx.active_object)) is not None
+        return not _editing_problem(ctx) and target_leaks(find_mod(ctx.active_object)) is not None
 
     def execute(self, ctx):
         mod = find_mod(ctx.active_object)
@@ -1105,10 +1363,19 @@ class CONTACTBLEND_OT_bump_only(bpy.types.Operator):
 
     @classmethod
     def poll(cls, ctx):
-        return bool(target_displaces(find_mod(ctx.active_object)))
+        if _editing_problem(ctx):
+            return False
+        tgt = mod_target(find_mod(ctx.active_object))
+        # Poll runs during UI redraw. Inspect nodes only after the user clicks.
+        return tgt is not None and tgt.type == "MESH" and any(
+            mat and getattr(mat, "displacement_method", "BUMP") != "BUMP"
+            for mat in tgt.data.materials)
 
     def execute(self, ctx):
         mats = target_displaces(find_mod(ctx.active_object))
+        if not mats:
+            self.report({"INFO"}, "No linked material displacement found on the target")
+            return {"CANCELLED"}
         for m in mats:
             m.displacement_method = "BUMP"
         self.report({"INFO"}, "Bump only: " + ", ".join(m.name for m in mats))
@@ -1123,67 +1390,150 @@ class CONTACTBLEND_PT_panel(bpy.types.Panel):
 
     def draw(self, ctx):
         col = self.layout.column()
-        col.operator(CONTACTBLEND_OT_add.bl_idname, icon="MOD_SIMPLEDEFORM")
-        mod = find_mod(ctx.active_object)
+        col.use_property_split = True
+        col.use_property_decorate = False
+        problem = _editing_problem(ctx)
+        if problem:
+            _ui_message(col, problem, ctx)
+            return
+        src, mod, tgt, ids, values = _ui_context(ctx)
         if not mod:
+            col.label(text=f"Object: {src.name}", icon="OBJECT_DATA")
+            others = [o for o in ctx.selected_objects if o is not src and o.type == "MESH"]
+            if len(others) == 1:
+                col.label(text=f"Target: {others[0].name}", icon="MESH_DATA")
+            else:
+                col.label(text="Select the ground, then the hero mesh")
+                col.label(text="The active mesh becomes the hero")
+            col.operator(CONTACTBLEND_OT_add.bl_idname, text="Create Contact Blend", icon="MOD_SIMPLEDEFORM")
+            return
+        if not {"Target", "Contact Distance", "Displace Ground", "Ground Conform", "Surface Offset"} <= ids.keys():
+            _ui_message(col, "Blend data is incomplete. Remove this blend and create it again", ctx, "ERROR")
+            col.operator(CONTACTBLEND_OT_remove.bl_idname, icon="TRASH")
+            return
+        col.label(text=src.name, icon="OBJECT_DATA")
+        _draw_modifier_input(col, mod, ids["Target"], "Target")
+        row = col.row(align=True)
+        row.scale_y = 1.2
+        row.operator(CONTACTBLEND_OT_update.bl_idname, icon="FILE_REFRESH")
+        row.prop(mod, "show_viewport", text="", icon="HIDE_OFF", toggle=True)
+        _draw_modifier_input(col, mod, ids["Contact Distance"], "Contact Distance")
+        _draw_modifier_input(col, mod, ids["Displace Ground"], "Deform Ground")
+        ground = col.column()
+        ground.enabled = values[ids["Displace Ground"]]
+        _draw_modifier_input(ground, mod, ids["Ground Conform"], "Conform Strength")
+        _draw_modifier_input(ground, mod, ids["Surface Offset"], "Surface Inset")
+        issues = _blend_issues(src, mod, ctx, detailed=False)
+        for severity, message in issues:
+            notice = col.box()
+            notice.alert = severity == "ERROR"
+            _ui_message(notice, message, ctx, "ERROR" if severity != "INFO" else "INFO")
+        if not issues:
+            col.label(text="Geometry updates live", icon="CHECKMARK")
+        col.separator()
+        col.operator(CONTACTBLEND_OT_remove.bl_idname, icon="TRASH")
+
+
+class _BlendSubpanel:
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Contact"
+    bl_parent_id = "CONTACTBLEND_PT_panel"
+
+    @classmethod
+    def poll(cls, ctx):
+        if _editing_problem(ctx):
+            return False
+        mod = find_mod(ctx.active_object)
+        required = {"Target", "Contact Distance", "Displace Ground", "Ground Conform", "Surface Offset"}
+        return mod is not None and (required | set(getattr(cls, "required_inputs", ()))) <= input_ids(mod.node_group).keys()
+
+
+class CONTACTBLEND_PT_quality(_BlendSubpanel, bpy.types.Panel):
+    bl_label = "Quality & Performance"
+    required_inputs = {"Contact Subdivisions"}
+
+    def draw(self, ctx):
+        _, mod, _, ids, values = _ui_context(ctx)
+        col = self.layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.enabled = values[ids["Displace Ground"]]
+        if "Viewport Subdivisions" not in ids:
+            col.label(text="Update Blend to enable viewport quality", icon="INFO")
             return
         row = col.row(align=True)
-        row.operator(CONTACTBLEND_OT_update.bl_idname, icon="FILE_REFRESH")
-        row.operator(CONTACTBLEND_OT_remove.bl_idname, icon="X")
-        col.separator()
-        ids = input_ids(mod.node_group)
-        for label, names in (
-                ("Contact", ("Target", "Contact Distance", "Surface Offset", "Displace Ground",
-                             "Ground Conform", "Contact Subdivisions")),
-                ("Shading", ("Normal Blend Distance", "Material Blend Distance",
-                             "Match Target Textures", "Target UV Map")),
-                ("Ground Detail", ("Ground Detail", "Detail Image", "Detail UV Map", "Detail Midlevel"))):
-            box = col.box().column()
-            box.label(text=label)
-            for name in names:
-                _draw_modifier_input(box, mod, ids[name], name)
-        col.separator()
-        col.operator(CONTACTBLEND_OT_material.bl_idname, icon="NODE_MATERIAL")
-        mat = ctx.active_object.active_material
-        if mat and mat.get("cb_texture_warnings"):
-            box = col.box().column()
-            for warning in mat["cb_texture_warnings"].splitlines():
-                box.label(text=warning, icon="ERROR")
+        for label, preset in (("Draft", "DRAFT"), ("Balanced", "BALANCED"), ("Final", "FINAL")):
+            levels = {"DRAFT": (0, 2), "BALANCED": (1, 2), "FINAL": (2, 3)}[preset]
+            selected = (values[ids["Use Viewport Quality"]]
+                        and (values[ids["Viewport Subdivisions"]], values[ids["Contact Subdivisions"]]) == levels)
+            row.operator(CONTACTBLEND_OT_quality.bl_idname, text=label, depress=selected).preset = preset
+        _draw_modifier_input(col, mod, ids["Use Viewport Quality"], "Separate Viewport Quality")
+        viewport = col.column()
+        viewport.enabled = values[ids["Use Viewport Quality"]]
+        _draw_modifier_input(viewport, mod, ids["Viewport Subdivisions"], "Viewport Subdivisions")
+        _draw_modifier_input(col, mod, ids["Contact Subdivisions"], "Render / Full Subdivisions")
+        _ui_message(col, "Draft speeds up editing; render quality stays separate", ctx)
 
-        # This one only breaks the render, so it is invisible until it is too late: say so.
-        leak = target_leaks(mod)
-        if leak:
-            box = col.box().column(align=True)
-            box.alert = True
-            box.label(text=f"'{leak.name}' still draws", icon="ERROR")
-            box.label(text="Seam will return in the render.")
-            box.operator(CONTACTBLEND_OT_hide_target.bl_idname, icon="RESTRICT_RENDER_ON")
 
-        # Displace Ground ticked but Ground Conform at zero is a contradiction: the ground copy
-        # is built and joined, costing everything it costs, and then multiplied out to nothing.
-        ids = input_ids(mod.node_group)
-        if modifier_values(mod)[ids["Displace Ground"]] and modifier_values(mod)[ids["Ground Conform"]] < 0.01:
-            box = col.box().column(align=True)
-            box.alert = True
-            box.label(text="Ground Conform is ~0", icon="ERROR")
-            box.label(text="Ground cannot move; no blend.")
-            _draw_modifier_input(box, mod, ids["Ground Conform"], "Ground Conform")
+class CONTACTBLEND_PT_shading(_BlendSubpanel, bpy.types.Panel):
+    bl_label = "Shading & Textures"
+    bl_options = {"DEFAULT_CLOSED"}
+    required_inputs = {"Normal Blend Distance", "Material Blend Distance", "Match Target Textures", "Target UV Map"}
 
-        # Material displacement is applied after the modifier stack, so nothing here can see
-        # or compensate for it. Silent in the viewport, ruinous at render.
-        for mat in target_displaces(mod):
-            box = col.box().column(align=True)
-            box.alert = True
-            box.label(text=f"'{mat.name}' displaces at render", icon="ERROR")
-            box.label(text="Geometry Nodes cannot see it.")
-            box.label(text="Rebuild it as a Displace modifier,")
-            box.label(text="or:")
-            box.operator(CONTACTBLEND_OT_bump_only.bl_idname, icon="MOD_SMOOTH")
+    def draw(self, ctx):
+        _, mod, tgt, ids, values = _ui_context(ctx)
+        col = self.layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        _draw_modifier_input(col, mod, ids["Normal Blend Distance"], "Normal Blend Distance")
+        _draw_modifier_input(col, mod, ids["Material Blend Distance"], "Material Blend Distance")
+        _draw_modifier_input(col, mod, ids["Match Target Textures"], "Match Target Textures")
+        uv = col.column()
+        uv.enabled = values[ids["Match Target Textures"]]
+        _draw_modifier_input(uv, mod, ids["Target UV Map"], "Target UV Map",
+                             search_data=tgt.data if tgt and tgt.type == "MESH" else None,
+                             search_property="uv_layers")
+        col.operator(CONTACTBLEND_OT_material.bl_idname, text="Refresh Material", icon="NODE_MATERIAL")
+        _ui_message(col, "Refresh after changing texture settings", ctx)
+
+
+class CONTACTBLEND_PT_detail(_BlendSubpanel, bpy.types.Panel):
+    bl_label = "Ground Detail"
+    bl_options = {"DEFAULT_CLOSED"}
+    required_inputs = {"Ground Detail", "Detail Image", "Detail UV Map", "Detail Midlevel"}
+
+    def draw(self, ctx):
+        _, mod, tgt, ids, values = _ui_context(ctx)
+        col = self.layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.enabled = values[ids["Displace Ground"]]
+        for name, label in (("Ground Detail", "Height"), ("Detail Image", "Height Map")):
+            _draw_modifier_input(col, mod, ids[name], label)
+        _draw_modifier_input(col, mod, ids["Detail UV Map"], "UV Map",
+                             search_data=tgt.data if tgt and tgt.type == "MESH" else None,
+                             search_property="uv_layers")
+        _draw_modifier_input(col, mod, ids["Detail Midlevel"], "Midlevel")
+
+
+class CONTACTBLEND_PT_diagnostics(_BlendSubpanel, bpy.types.Panel):
+    bl_label = "Checks & Fixes"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, ctx):
+        col = self.layout.column()
+        col.operator(CONTACTBLEND_OT_diagnostics.bl_idname, icon="VIEWZOOM")
+        col.operator(CONTACTBLEND_OT_hide_target.bl_idname, icon="RESTRICT_RENDER_ON")
+        col.operator(CONTACTBLEND_OT_bump_only.bl_idname, icon="MOD_SMOOTH")
+        _ui_message(col, "Full geometry report: run contact_blend_diag.py", ctx)
 
 
 _classes = (CONTACTBLEND_OT_add, CONTACTBLEND_OT_update, CONTACTBLEND_OT_remove,
             CONTACTBLEND_OT_material, CONTACTBLEND_OT_hide_target,
-            CONTACTBLEND_OT_bump_only, CONTACTBLEND_PT_panel)
+            CONTACTBLEND_OT_bump_only, CONTACTBLEND_OT_quality, CONTACTBLEND_OT_diagnostics,
+            CONTACTBLEND_PT_panel, CONTACTBLEND_PT_quality, CONTACTBLEND_PT_shading,
+            CONTACTBLEND_PT_detail, CONTACTBLEND_PT_diagnostics)
 
 
 def _menu(self, ctx):

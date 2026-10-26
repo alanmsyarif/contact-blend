@@ -21,6 +21,8 @@ as a seam. Shading and materials are cross-faded across the same contact band.
 The add-on builds a Geometry Nodes group named `Contact Blend` on first use and stamps it with a
 version. Later releases rebuild that group **in place** on load, carrying your settings across by
 socket name, so updating never means hunting down and deleting the old node group.
+Compatible interface sockets retain their identifiers on upgrade, preserving existing
+keyframes, drivers, and external node-group connections.
 
 <details>
 <summary><b>Upgrading from Blend To Surface (1.0)</b></summary>
@@ -66,6 +68,36 @@ the add-on hid the target. For blends created before 1.2, original visibility is
 is left unchanged on removal unless it has since been recorded by this version. Untagged
 legacy shader nodes are left disconnected on removal because they may contain user edits.
 
+### Sidebar workflow
+
+The main panel keeps the target, contact radius, deformation strength, and Update action
+within reach. It explains invalid selections, Object Mode requirements, missing materials,
+and pending texture updates. The eye button pauses the blend in the viewport without changing
+its render toggle. Removing a blend from the sidebar asks for confirmation; scripted execution
+remains available without a dialog.
+
+Expand **Quality & Performance**, **Shading & Textures**, **Ground Detail**, or **Checks & Fixes**
+as needed. UV fields search the target's available layers. Ground-only controls are disabled
+in shading-only mode. Detailed material checks run when you request **Check Blend**, which
+writes a settings report to the `Contact Blend Status` Text datablock without evaluating meshes.
+Use `contact_blend_diag.py` for the deeper evaluated-geometry report.
+
+### Interactive and render quality
+
+Choose a quality preset to lower the cost of editing while retaining a separate render level:
+
+| Preset | Viewport subdivisions | Render subdivisions |
+|---|---|---|
+| Draft | 0 | 2 |
+| Balanced | 1 | 2 |
+| Final | 2 | 3 |
+
+Presets change only these quality settings; they keep contact dimensions, materials, UV choices,
+and detail settings. **Separate Viewport Quality** can be disabled to use **Render / Full
+Subdivisions** everywhere. Existing blends opt out on upgrade, preserving their previous density.
+Each subdivision level multiplies the selected contact faces by four, so use Draft first on
+large ground meshes. High render levels display a cost warning.
+
 **The target needs vertices in the contact area.** Conforming is vertex-driven: a 4-vertex plane
 cannot crater. Either subdivide it or raise `Contact Subdivisions`.
 
@@ -85,7 +117,8 @@ coordinates rather than the hero's UVs, origin, or bounding box:
 Unconnected image textures, common procedural textures, Texture Coordinate and UV Map nodes,
 and tangent-space Normal Map UV references are handled. Shared shader groups are copied before
 their internal coordinate nodes are adjusted. The joined ground gets a separate corrected
-material for the target's active material slot; the original target material is never edited.
+material for the target's active material slot when its shader requires coordinate correction;
+simple uniform materials reuse the original. The original target material is never edited.
 
 Click **Update Blend** after changing texture matching, the UV map, or the target shader.
 Existing blends need one update to refresh their copied shaders for this feature.
@@ -107,6 +140,8 @@ coordinate behavior for materials requiring a custom setup.
 | **Displace Ground** | on | Conform the ground at all. Off means shading and material blending only, and the target stays visible. |
 | **Ground Conform** | 1.0 | Master multiplier on the conform. **At 0 the ground cannot move and there is no blend** the panel warns about this. |
 | **Contact Subdivisions** | 2 | Subdivides only the contact island. Each level is 4× the faces, so 4 is 256× per face; 2 is usually plenty. |
+| **Use Viewport Quality** | off | Use a separate interactive subdivision level. Render / Full Subdivisions still controls renders. |
+| **Viewport Subdivisions** | 2 | Subdivision level used while editing when Separate Viewport Quality is enabled. |
 | **Ground Detail** | 0.0 m | Height of the contact-zone displacement. |
 | **Detail Image** | | Height map for that displacement. |
 | **Detail UV Map** | `UVMap` | Which UV map to sample it through. |
@@ -116,11 +151,13 @@ coordinate behavior for materials requiring a custom setup.
 | **Match Target Textures** | on | Match UV, Object, and Generated coordinates in the copied target shader. Click Update Blend after changing. |
 | **Target UV Map** | target's render UV | UV map to project onto the hero. Click Update Blend after changing. |
 
-Controls are grouped into **Contact**, **Shading**, and **Ground Detail** in the sidebar.
+Core contact settings stay in the main panel; quality, shading, detail, and checks have
+collapsible sections. Shading, detail, and checks start collapsed.
 
 **Buttons.** *Blend Materials* refreshes the target shader without accumulating copies.
 *Hide Target From Render*
-and *Set Target To Bump Only* appear only when those hazards are actually present.
+and *Set Target To Bump Only* in Checks & Fixes are enabled when applicable. The latter checks
+for linked displacement when clicked, keeping ordinary panel redraws free of shader scans.
 
 ## How it works
 
@@ -176,6 +213,9 @@ blender --background --python-exit-code 1 --python contact_blend.py
 blender --background --python-exit-code 1 --python tests/test_workflow.py
 blender --background --python-exit-code 1 --python tests/test_textures.py
 blender --background --python-exit-code 1 --python tests/test_compatibility.py
+blender --background --python-exit-code 1 --python tests/test_geometry_performance.py
+blender --background --python-exit-code 1 --python tests/test_shader_performance.py
+blender --background --python-exit-code 1 --python tests/test_ui.py
 ```
 
 ```
@@ -204,6 +244,12 @@ The compatibility suite covers modifier input reads/writes and operator polling 
 legacy and Blender 5.2 APIs, bookkeeping after renaming/removing modifiers, saved UV choices,
 and preservation of field modes and material references during node-group upgrades.
 
+Performance regressions cover actual evaluated geometry and Cycles renders, verifying that
+lower viewport quality retains full render quality. Shader tests check that disconnected nodes
+are excluded, frame hierarchy survives, nested groups remain isolated, and ground volume,
+displacement, and renderer-specific outputs are preserved. UI tests resolve real RNA property
+bindings and cover search fields, presets, invalid contexts, confirmation, and read-only redraws.
+
 For a headless environment with the official `bpy` package installed, the same checks can run
 directly with that Python interpreter:
 
@@ -212,7 +258,34 @@ python -B contact_blend.py
 python -B tests/test_workflow.py
 python -B tests/test_textures.py
 python -B tests/test_compatibility.py
+python -B tests/test_geometry_performance.py
+python -B tests/test_shader_performance.py
+python -B tests/test_ui.py
 ```
+
+### Performance measurements
+
+Shading-only mode now samples the original target for normals and UVs, bypassing the ground
+subdivision, detail, and conform branch. Material refresh copies only nodes upstream of the
+target Surface shader and remaps only relevant shader-group outputs. Simple uniform ground
+materials do not need another material copy. These changes avoid persistent caches, so edits
+to materials and node groups remain visible after Update Blend.
+
+The portable benchmarks accept an optional older add-on file for comparison using the same
+machine and Blender runtime:
+
+```bash
+python -B benchmarks/geometry.py [path/to/older/contact_blend.py]
+python -B benchmarks/shaders.py --nodes 500 --samples 3 [--addon path/to/older/contact_blend.py]
+```
+
+On Blender 5.2.3, a 60×60 ground grid with subdivision level 4 in shading-only mode improved
+from roughly **574 ms to 1.8 ms** per forced evaluation. A material with a simple rendered shader
+and 500 disconnected Noise nodes improved from roughly **19.4 s to 2.2 ms** per refresh, with
+the source material shrinking from 509 to 5 nodes. These are deliberately expensive stress
+fixtures demonstrating skipped work, not general viewport or render speed guarantees. Timing
+depends on the scene, machine, and Blender version; benchmark scripts verify meaningful output
+and impose no timing thresholds.
 
 ## License
 

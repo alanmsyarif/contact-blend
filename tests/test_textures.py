@@ -116,10 +116,16 @@ class TextureTests(unittest.TestCase):
 
     def test_implicit_image_uvs_and_named_uv_nodes_are_rebound(self):
         tree = self.target.active_material.node_tree
-        tree.nodes.new("ShaderNodeTexImage")
+        image = tree.nodes.new("ShaderNodeTexImage")
         uv = tree.nodes.new("ShaderNodeUVMap")
         uv.uv_map = "GroundUV"
         normal = tree.nodes.new("ShaderNodeNormalMap")
+        noise = tree.nodes.new("ShaderNodeTexNoise")
+        bsdf = tree.nodes["Principled BSDF"]
+        tree.links.new(image.outputs["Color"], bsdf.inputs["Base Color"])
+        tree.links.new(uv.outputs["UV"], noise.inputs["Vector"])
+        tree.links.new(noise.outputs[0], bsdf.inputs["Roughness"])
+        tree.links.new(normal.outputs["Normal"], bsdf.inputs["Normal"])
         self.apply()
         image = self.copied_nodes("TEX_IMAGE")[0]
         self.assertEqual(image.inputs["Vector"].links[0].from_node.uv_map, cb.TARGET_UV_ATTR)
@@ -143,6 +149,7 @@ class TextureTests(unittest.TestCase):
         coord = tree.nodes.new("ShaderNodeTexCoord")
         noise = tree.nodes.new("ShaderNodeTexNoise")
         tree.links.new(coord.outputs["Object"], noise.inputs["Vector"])
+        tree.links.new(noise.outputs["Color"], tree.nodes["Principled BSDF"].inputs["Base Color"])
         mod, ids = self.apply(ground=True)
         self.assertEqual(self.copied_nodes("TEX_COORD")[0].object, self.target)
         ground = cb.modifier_values(mod)[ids["Ground Material"]]
@@ -153,8 +160,12 @@ class TextureTests(unittest.TestCase):
     def test_explicit_external_object_reference_is_preserved(self):
         empty = bpy.data.objects.new("Mapping origin", None)
         bpy.context.collection.objects.link(empty)
-        coord = self.target.active_material.node_tree.nodes.new("ShaderNodeTexCoord")
+        tree = self.target.active_material.node_tree
+        coord = tree.nodes.new("ShaderNodeTexCoord")
         coord.object = empty
+        noise = tree.nodes.new("ShaderNodeTexNoise")
+        tree.links.new(coord.outputs["Object"], noise.inputs["Vector"])
+        tree.links.new(noise.outputs["Color"], tree.nodes["Principled BSDF"].inputs["Base Color"])
         self.apply()
         self.assertEqual(self.copied_nodes("TEX_COORD")[0].object, empty)
 
@@ -169,6 +180,7 @@ class TextureTests(unittest.TestCase):
         tree = self.target.active_material.node_tree
         node = tree.nodes.new("ShaderNodeGroup")
         node.node_tree = group
+        tree.links.new(node.outputs["Color"], tree.nodes["Principled BSDF"].inputs["Base Color"])
         mod, ids = self.apply()
         for _ in range(3):
             self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
@@ -184,7 +196,9 @@ class TextureTests(unittest.TestCase):
         self.assertIn(group.name, bpy.data.node_groups)
 
     def test_texture_matching_can_be_disabled(self):
-        self.target.active_material.node_tree.nodes.new("ShaderNodeTexImage")
+        tree = self.target.active_material.node_tree
+        image = tree.nodes.new("ShaderNodeTexImage")
+        tree.links.new(image.outputs["Color"], tree.nodes["Principled BSDF"].inputs["Base Color"])
         mod, ids = self.apply()
         cb.modifier_values(mod)[ids["Match Target Textures"]] = False
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
@@ -201,7 +215,11 @@ class TextureTests(unittest.TestCase):
         tree = self.target.active_material.node_tree
         node = tree.nodes.new("ShaderNodeUVMap")
         node.uv_map = "SecondaryUV"
-        tree.nodes.new("ShaderNodeTexImage")
+        image = tree.nodes.new("ShaderNodeTexImage")
+        noise = tree.nodes.new("ShaderNodeTexNoise")
+        tree.links.new(node.outputs["UV"], noise.inputs["Vector"])
+        tree.links.new(noise.outputs[0], tree.nodes["Principled BSDF"].inputs["Roughness"])
+        tree.links.new(image.outputs["Color"], tree.nodes["Principled BSDF"].inputs["Base Color"])
         mod, ids = self.apply()
         self.assertIn("SecondaryUV", self.source.active_material["cb_texture_warnings"])
         cb.modifier_values(mod)[ids["Target UV Map"]] = "MissingUV"

@@ -76,6 +76,11 @@ def report(obj):
         add(f"target visibility: eye_hidden={tgt.hide_get()} hide_render={tgt.hide_render} "
             f"hide_viewport={tgt.hide_viewport}")
         add(f"Displace Ground  : {ground_on}")
+        if "Use Viewport Quality" in ids:
+            separate = input_value(mod, ids["Use Viewport Quality"], False)
+            full = input_value(mod, ids["Contact Subdivisions"], 2)
+            viewport = input_value(mod, ids["Viewport Subdivisions"], full) if separate else full
+            add(f"contact quality  : viewport={viewport} render={full} separate={separate}")
         if ground_on and not tgt.hide_render:
             add("  ^-- target STILL RENDERS while a conformed copy is joined in."
                 " The flat original cuts through the crater at F12 only.")
