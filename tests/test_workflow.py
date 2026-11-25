@@ -12,7 +12,9 @@ import warnings
 import bpy
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import contact_blend as cb
+import fake_layout
 
 
 class WorkflowTests(unittest.TestCase):
@@ -551,10 +553,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNotNone(cb._material_mix(self.source.active_material))
         self.assertFalse(self.target.hide_get(), "previous target not restored on retarget")
 
-        class Layout:
-            def __getattr__(self, name):
-                return lambda *args, **kwargs: self
-        cb.CONTACTBLEND_PT_panel.draw(types.SimpleNamespace(layout=Layout()), bpy.context)
+        cb.CONTACTBLEND_PT_panel.draw(types.SimpleNamespace(layout=fake_layout.Layout()), bpy.context)
         for op in (cb.CONTACTBLEND_OT_update, cb.CONTACTBLEND_OT_hide_target, cb.CONTACTBLEND_OT_remove):
             op.poll(bpy.context)
         self.assertIsNone(cb.target_leaks(mod))

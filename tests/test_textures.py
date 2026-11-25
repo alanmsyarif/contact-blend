@@ -46,6 +46,15 @@ class TextureTests(unittest.TestCase):
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         return mod, ids
 
+    def joined(self):
+        """Turn the blend into a pre-2.0 one: the ground joined into the object's own output."""
+        mod = cb.find_mod(self.source)
+        cb.set_socket(mod, "Shared Ground", False)
+        bpy.context.view_layer.objects.active = self.source
+        self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
+        self.assertIsNone(cb.find_proxy(self.target))
+        return mod
+
     def copied_nodes(self, kind):
         return [n for n in self.source.active_material.node_tree.nodes
                 if n.type == kind and n.get(cb.GENERATED_KEY) == "target"]
@@ -82,37 +91,65 @@ class TextureTests(unittest.TestCase):
         self.target.data.materials.append(bpy.data.materials["Ground"])
         self.target.data.uv_layers.active.name = "GroundUV"
         bpy.data.objects.remove(self.source, do_unlink=True)
-        bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, 0.4))
+        # Off the grid lines: at (0, 0) the cube's sides lie exactly on ground edges, and which face
+        # a vertex sitting on the surface "belongs" to is then a coin toss decided by rounding.
+        bpy.ops.mesh.primitive_cube_add(size=1, location=(0.03, 0.02, 0.4))
         self.source = bpy.context.object
         self.source.data.materials.append(bpy.data.materials["Hero"])
         mod, ids = self.apply(ground=True)
-        evaluated = self.source.evaluated_get(bpy.context.evaluated_depsgraph_get())
-        mesh = evaluated.to_mesh()
+        # Shared: the object samples a locally conformed patch, which has to match the ground
+        # the proxy draws wherever the target shader can show (inside every blend distance).
+        reach = max(mod[ids["Contact Distance"]], mod[ids["Material Blend Distance"]],
+                    mod[ids["Normal Blend Distance"]])
+        proxy = cb.find_proxy(self.target)
+        self.assertIsNotNone(proxy)
+        self.assertGreater(self.check_sampled_uvs(proxy, None, reach), 0)
+        # Joined: the object samples its own joined copy, everywhere.
+        self.joined()
+        self.assertGreater(self.check_sampled_uvs(self.source, mod[ids["Ground Material"]], None), 0)
+
+    def check_sampled_uvs(self, ground_obj, ground_material, reach):
+        """Compare the object's projected UVs with the UVs on the ground it sits on. Returns
+        how many corners were checked."""
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        hero = self.source.evaluated_get(depsgraph)
+        mesh = hero.to_mesh()
+        ground = ground_obj.evaluated_get(depsgraph)
+        gmesh = mesh if ground_obj is self.source else ground.to_mesh()
         try:
-            mesh.calc_loop_triangles()
-            ground = mod[ids["Ground Material"]]
-            triangles = [tri for tri in mesh.loop_triangles
-                         if mesh.materials[tri.material_index].name == ground.name]
-            bvh = BVHTree.FromPolygons([v.co for v in mesh.vertices],
-                                      [tri.vertices for tri in triangles], all_triangles=True)
-            original_uvs = mesh.uv_layers["GroundUV"].data
+            gmesh.calc_loop_triangles()
+            to_hero = self.source.matrix_world.inverted() @ ground_obj.matrix_world
+            triangles = [tri for tri in gmesh.loop_triangles if ground_material is None
+                         or gmesh.materials[tri.material_index].name == ground_material.name]
+            co = [to_hero @ v.co for v in gmesh.vertices]
+            bvh = BVHTree.FromPolygons(co, [tri.vertices for tri in triangles], all_triangles=True)
+            original_uvs = gmesh.uv_layers["GroundUV"].data
             sampled_uvs = mesh.uv_layers[cb.TARGET_UV_ATTR].data
             count = 0
             for poly in mesh.polygons:
-                if mesh.materials[poly.material_index].name == ground.name:
+                if ground_material and mesh.materials[poly.material_index].name == ground_material.name:
                     continue
                 for index in poly.loop_indices:
                     point = mesh.vertices[mesh.loops[index].vertex_index].co
-                    nearest, _, tri_index, _ = bvh.find_nearest(point)
-                    tri = triangles[tri_index]
-                    expected = barycentric_transform(
-                        nearest, *(mesh.vertices[i].co for i in tri.vertices),
-                        *(Vector((*original_uvs[i].uv, 0)) for i in tri.loops))
-                    self.assertLess((sampled_uvs[index].uv - expected.xy).length, 1e-5)
+                    _, _, _, dist = bvh.find_nearest(point)
+                    if reach is not None and dist > reach:
+                        continue
+                    # Where several triangles are equally near (a crease the ground folds around),
+                    # which one is "the" nearest is decided by rounding; any of them is right.
+                    errors = []
+                    for near, _, near_index, _ in bvh.find_nearest_range(point, dist + 1e-6):
+                        tri = triangles[near_index]
+                        expected = barycentric_transform(
+                            near, *(co[i] for i in tri.vertices),
+                            *(Vector((*original_uvs[i].uv, 0)) for i in tri.loops))
+                        errors.append((sampled_uvs[index].uv - expected.xy).length)
+                    self.assertLess(min(errors), 1e-5)
                     count += 1
-            self.assertGreater(count, 0)
+            return count
         finally:
-            evaluated.to_mesh_clear()
+            if gmesh is not mesh:
+                ground.to_mesh_clear()
+            hero.to_mesh_clear()
 
     def test_implicit_image_uvs_and_named_uv_nodes_are_rebound(self):
         tree = self.target.active_material.node_tree
@@ -145,10 +182,16 @@ class TextureTests(unittest.TestCase):
         tree.links.new(coord.outputs["Object"], noise.inputs["Vector"])
         mod, ids = self.apply(ground=True)
         self.assertEqual(self.copied_nodes("TEX_COORD")[0].object, self.target)
-        ground = mod[ids["Ground Material"]]
+        # shared: one corrected ground material, on the proxy
+        ground = cb.socket(cb.ground_mod(cb.find_proxy(self.target)), "Ground Material")
         self.assertNotEqual(ground, self.target.active_material)
         self.assertEqual(ground.node_tree.nodes[coord.name].object, self.target)
         self.assertIsNone(coord.object)
+        # joined: the object's own copy gets the same correction
+        self.joined()
+        ground = mod[ids["Ground Material"]]
+        self.assertNotEqual(ground, self.target.active_material)
+        self.assertEqual(ground.node_tree.nodes[coord.name].object, self.target)
 
     def test_explicit_external_object_reference_is_preserved(self):
         empty = bpy.data.objects.new("Mapping origin", None)
@@ -169,13 +212,14 @@ class TextureTests(unittest.TestCase):
         tree = self.target.active_material.node_tree
         node = tree.nodes.new("ShaderNodeGroup")
         node.node_tree = group
-        mod, ids = self.apply()
+        mod, ids = self.apply(ground=True)
         for _ in range(3):
             self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         copied = self.copied_nodes("GROUP")[0].node_tree
         self.assertNotEqual(copied, group)
         self.assertTrue(copied.nodes[image.name].inputs["Vector"].is_linked)
         self.assertFalse(image.inputs["Vector"].is_linked)
+        # one corrected ground material (the proxy's) and its private group, plus the object's
         self.assertEqual(sum(bool(m.get(cb.TEXTURE_DATA_KEY)) for m in bpy.data.materials), 1)
         self.assertEqual(sum(bool(g.get(cb.TEXTURE_DATA_KEY)) for g in bpy.data.node_groups), 2)
         self.assertEqual(bpy.ops.object.contact_blend_remove(), {"FINISHED"})
@@ -189,13 +233,18 @@ class TextureTests(unittest.TestCase):
         mod[ids["Match Target Textures"]] = False
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertFalse(self.copied_nodes("TEX_IMAGE")[0].inputs["Vector"].is_linked)
-        self.assertEqual(mod[ids["Ground Material"]], self.target.active_material)
-        evaluated = self.source.evaluated_get(bpy.context.evaluated_depsgraph_get())
-        mesh = evaluated.to_mesh()
-        try:
-            self.assertNotIn(cb.TARGET_UV_ATTR, mesh.attributes)
-        finally:
-            evaluated.to_mesh_clear()
+        for mode in ("shared", "joined"):
+            with self.subTest(mode=mode):
+                if mode == "joined":
+                    self.joined()
+                    # a joined copy then keeps the target's material unchanged
+                    self.assertEqual(mod[ids["Ground Material"]], self.target.active_material)
+                evaluated = self.source.evaluated_get(bpy.context.evaluated_depsgraph_get())
+                mesh = evaluated.to_mesh()
+                try:
+                    self.assertNotIn(cb.TARGET_UV_ATTR, mesh.attributes)
+                finally:
+                    evaluated.to_mesh_clear()
 
     def test_additional_uv_maps_and_missing_uvs_are_reported(self):
         tree = self.target.active_material.node_tree

@@ -2,18 +2,35 @@
 
 """Report every viewport-vs-render difference that can break Contact Blend.
 
-Open in Blender's Text Editor with your real scene loaded, select the blended object,
-and press Run Script. Read the output in Window > Toggle System Console.
+Open in Blender's Text Editor with your real scene loaded, select the blended object (or its
+ground), and press Run Script. The report lands in the "Contact Blend Report" text.
+
+With the add-on enabled this runs the add-on's own checks -- the same ones as the Diagnose
+button in the sidebar, which know about the shared ground. Without it (an old file opened on a
+machine that does not have the add-on, say) it falls back to the copy below, which covers the
+joined-ground checks and only reports whether a shared ground exists.
 """
 
 import bpy
 import collections
+import sys
 
 GROUP = "Contact Blend"
 ATTR = "blend"
 LEGACY_NAMES = ("Blend To Surface",)   # pre-1.1; the add-on renames these on load
 NAMES = (GROUP,) + LEGACY_NAMES
 VERSION_KEYS = ("cb_version", "bts_version")
+GROUND_VERSION_KEY = "cb_ground_version"
+PROXY_KEY = "cb_ground_proxy"
+
+
+def addon():
+    """The loaded Contact Blend add-on module, whatever name it was installed under."""
+    for module in list(sys.modules.values()):
+        info = getattr(module, "bl_info", None)
+        if isinstance(info, dict) and info.get("name") == "Contact Blend" and hasattr(module, "diagnose"):
+            return module
+    return None
 
 
 def group_version(ng):
@@ -75,6 +92,15 @@ def report(obj):
            if mod.node_group.name in LEGACY_NAMES else ""))
     add(f"group ver: {group_version(mod.node_group)}  nodes={len(mod.node_group.nodes)}"
         f"  sockets={len(ids)}")
+    if "Shared Ground" in ids and mod.get(ids["Shared Ground"]):
+        proxies = [o for o in bpy.data.objects if o.get(PROXY_KEY) and any(
+            m.type == "NODES" and m.node_group and GROUND_VERSION_KEY in m.node_group
+            and m.get(next((i.identifier for i in m.node_group.interface.items_tree
+                            if i.item_type == "SOCKET" and i.name == "Target"), "")) == tgt
+            for m in o.modifiers)]
+        add("mode     : shared ground; " + (f"drawn by '{proxies[0].name}'" if proxies
+                                            else "MISSING  <-- press Update in the sidebar"))
+        add("  (enable the add-on for the full shared-ground checks)")
     if group_version(mod.node_group) is None:
         add("  ^-- unstamped: this group predates auto-upgrade. Reload the addon;"
             " build_group() will rebuild it in place and keep your settings.")
@@ -225,7 +251,11 @@ def report(obj):
 TEXT = "Contact Blend Report"
 
 obj = bpy.context.active_object
-lines = report(obj) if obj else ["FAIL  no active object"]
+_addon = addon()
+if _addon is not None:
+    lines = _addon.diagnose(obj)
+else:
+    lines = report(obj) if obj else ["FAIL  no active object"]
 body = "\n".join(["Contact Blend diagnostic", "=" * 70] + lines)
 
 # print() lands in the system console, which is hidden by default on Windows. Write the

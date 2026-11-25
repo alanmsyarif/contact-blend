@@ -38,6 +38,10 @@ def grid(name, size, cells, height=None):
 
 
 class GeometryTests(unittest.TestCase):
+    """Run against the shared ground (the default for new blends); JoinedGeometryTests below
+    runs every test again against the legacy per-object joined copy."""
+    SHARED = True
+
     def setUp(self):
         bpy.ops.wm.read_factory_settings(use_empty=True)
 
@@ -61,7 +65,36 @@ class GeometryTests(unittest.TestCase):
         bpy.context.view_layer.objects.active = src
         self.assertEqual(bpy.ops.object.contact_blend(), {"FINISHED"})
         mod = cb.find_mod(src)
+        self.assertTrue(cb.is_shared(mod))
+        if not self.SHARED:
+            # What a blend made before 2.0 is: the ground joined into the object's own output.
+            # Adding an object converts the ground's other blends to shared, so put them all back.
+            bpy.ops.object.select_all(action="DESELECT")
+            for obj, m in cb.blends(tgt):
+                cb.set_socket(m, "Shared Ground", False)
+                obj.select_set(True)
+            bpy.context.view_layer.objects.active = src
+            self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
+            self.assertIsNone(cb.find_proxy(tgt))
         return mod, cb.input_ids(mod.node_group)
+
+    def set_ground(self, obj, name, value):
+        """Ground-level settings live on the proxy when shared, on the object when joined."""
+        mod = cb.find_mod(obj)
+        if self.SHARED:
+            mod = cb.ground_mod(cb.find_proxy(cb.mod_target(mod)))
+        cb.set_socket(mod, name, value)
+
+    def ground_view(self, obj):
+        """(object that draws the ground, its evaluated mesh, the ground's polygons)."""
+        mod = cb.find_mod(obj)
+        if self.SHARED:
+            owner = cb.find_proxy(cb.mod_target(mod))
+            self.assertIsNotNone(owner, "no shared ground")
+            me = self.evaluated(owner)
+            return owner, me, list(me.polygons)
+        me = self.evaluated(obj)
+        return obj, me, self.ground_polys(me, mod, cb.input_ids(mod.node_group))
 
     def evaluated(self, obj):
         obj.update_tag()
@@ -78,7 +111,7 @@ class GeometryTests(unittest.TestCase):
 
     def hero_blend(self, obj, me, mod, ids):
         """{position relative to the object origin, in world metres: blend} for the hero part."""
-        ground = {i for p in self.ground_polys(me, mod, ids) for i in p.vertices}
+        ground = set() if self.SHARED else {i for p in self.ground_polys(me, mod, ids) for i in p.vertices}
         values = me.attributes[cb.ATTR].data
         origin = obj.matrix_world.translation
         out = {}
@@ -110,9 +143,9 @@ class GeometryTests(unittest.TestCase):
         mod, ids = self.apply(rock, ground)
         lows = {}
         for level in (0, 3, 5):
-            mod[ids["Contact Subdivisions"]] = level
-            me = self.evaluated(rock)
-            pts = self.ground_world(rock, me, self.ground_polys(me, mod, ids))
+            self.set_ground(rock, "Contact Subdivisions", level)
+            owner, me, polys = self.ground_view(rock)
+            pts = self.ground_world(owner, me, polys)
             lows[level] = min(p.z for p in pts.values())
             corners = [p for p in pts.values() if abs(p.x) > 2 - 1e-4 and abs(p.y) > 2 - 1e-4]
             self.assertEqual(len(corners), 4)
@@ -129,10 +162,9 @@ class GeometryTests(unittest.TestCase):
         self.material(ground, "Ground")
         rock = self.sphere((1, 1, 0.3))
         mod, ids = self.apply(rock, ground)
-        mod[ids["Contact Subdivisions"]] = 3
-        me = self.evaluated(rock)
-        polys = self.ground_polys(me, mod, ids)
-        pts = self.ground_world(rock, me, polys)
+        self.set_ground(rock, "Contact Subdivisions", 3)
+        owner, me, polys = self.ground_view(rock)
+        pts = self.ground_world(owner, me, polys)
         self.assertLess(min(p.z for p in pts.values()), -0.05, "ground did not crater")
         cut = {i for i in self.open_edge_verts(polys)
                if abs(pts[i].x) < 10 - 1e-4 and abs(pts[i].y) < 10 - 1e-4}
@@ -152,17 +184,16 @@ class GeometryTests(unittest.TestCase):
         self.material(ground, "Ground")
         rock = self.sphere((0.1, 0.2, 0.35))
         mod, ids = self.apply(rock, ground)
-        me = self.evaluated(rock)
-        polys = self.ground_polys(me, mod, ids)
+        owner, me, polys = self.ground_view(rock)
         verts = {i for p in polys for i in p.vertices}
+        world = self.ground_world(owner, me, polys)
         self.assertGreater(len(verts), (41 * 41) * 1.2, "contact island was not subdivided")
         keys = collections.Counter(tuple(round(c, 6) for c in me.vertices[i].co) for i in verts)
         dup = [k for k, n in keys.items() if n > 1]
         self.assertFalse(dup, f"{len(dup)} unwelded duplicate ground vertices")
         # ...and the cut is really there: some open edges lie away from the ground's rim
         interior = {i for i in self.open_edge_verts(polys)
-                    if max(abs(me.vertices[i].co.x + rock.location.x),
-                           abs(me.vertices[i].co.y + rock.location.y)) < 2 - 1e-4}
+                    if max(abs(world[i].x), abs(world[i].y)) < 2 - 1e-4}
         self.assertTrue(interior, "no cut inside the ground; the test is not biting")
 
     def test_displace_off_shades_from_the_raw_target(self):
@@ -174,7 +205,9 @@ class GeometryTests(unittest.TestCase):
         rock = bpy.context.object
         self.material(rock, "Rock")
         mod, ids = self.apply(rock, ground)
-        mod[ids["Displace Ground"]] = False
+        rock.contact_blend_displace = False
+        self.assertFalse(mod[ids["Displace Ground"]])
+        self.assertIsNone(cb.find_proxy(ground), "the shared ground outlived Displace Ground")
         self.assertTrue(mod[ids["Match Target Textures"]])
         me = self.evaluated(rock)
         self.assertEqual(len(me.vertices), 8)
@@ -207,9 +240,10 @@ class GeometryTests(unittest.TestCase):
         self.material(ground, "Ground")
         rock = self.sphere((0, 0, 0.3))
         mod, ids = self.apply(rock, ground)
-        mod[ids["Displace Ground"]] = False
+        rock.contact_blend_displace = False
 
         def cost(level):
+            # the object's own socket: what its local patch would be cut with
             mod[ids["Contact Subdivisions"]] = level
             times = []
             for i in range(3):
@@ -239,10 +273,17 @@ class GeometryTests(unittest.TestCase):
             mod[ids["Contact Distance"]] = mod[ids["Material Blend Distance"]] = 0.3
             mod[ids["Normal Blend Distance"]] = 0.2
             mod[ids["Surface Offset"]] = 0.002
+            obj.update_tag()       # socket writes from Python do not tag; the UI would
+        for obj in (plain, scaled):
+            mod = cb.find_mod(obj)
+            ids = cb.input_ids(mod.node_group)
             me = self.evaluated(obj)
             blend = self.hero_blend(obj, me, mod, ids)
-            pts = self.ground_world(obj, me, self.ground_polys(me, mod, ids))
-            results[obj.name] = blend, min(p.z for p in pts.values()), len(pts)
+            owner, gme, polys = self.ground_view(obj)
+            # only the ground around this object: with a shared ground both craters are in it
+            near = [p for p in self.ground_world(owner, gme, polys).values()
+                    if (p.xy - obj.location.xy).length < 0.95]   # no grid point is 0.95 away
+            results[obj.name] = blend, min(p.z for p in near), len(near)
         (b0, z0, n0), (b1, z1, n1) = results["Plain"], results["Scaled"]
         self.assertGreater(max(b0.values()), 0.9)
         self.assertEqual(b0.keys(), b1.keys(), "hero shapes do not match; test is broken")
@@ -267,9 +308,14 @@ class GeometryTests(unittest.TestCase):
         me = self.evaluated(rock)
         blend = self.hero_blend(rock, me, mod, ids)
         self.assertGreater(max(blend.values()), 0.9, "blend is empty against an instanced target")
-        pts = self.ground_world(rock, me, self.ground_polys(me, mod, ids))
+        pts = self.ground_world(*self.ground_view(rock))
         self.assertGreater(len(pts), 41 * 41)
         self.assertLess(min(p.z for p in pts.values()), -0.05, "instanced ground did not crater")
+
+
+class JoinedGeometryTests(GeometryTests):
+    """The same checks on blends in the legacy joined mode, which old files keep using."""
+    SHARED = False
 
 
 if __name__ == "__main__":
