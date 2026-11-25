@@ -10,6 +10,7 @@ import types
 import unittest
 
 import bpy
+from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -116,7 +117,11 @@ class SharedGroundTests(SharedBase):
             inst.object.to_mesh_clear()
         self.assertEqual(drawing, [proxy])
         for r in rocks:
-            self.assertEqual(len(self.evaluated(r).vertices), len(r.data.vertices))
+            me = self.evaluated(r)
+            self.assertEqual(len(me.vertices), len(r.data.vertices))
+            # the shared ground sinks along this per-point normal (smooth across faces, so ties
+            # between equally near faces cannot flip it from run to run)
+            self.assertEqual(me.attributes[cb.NORMAL_ATTR].domain, "POINT")
         me, pts = self.ground_points()
         for r in rocks:
             self.assertLess(self.dip(pts, r), -0.03, f"no crater under {r.name}")
@@ -396,8 +401,22 @@ class LegacyTests(unittest.TestCase):
             positions = [c for v in me.vertices for c in v.co]
             self.assertEqual(len(positions), len(scene["cb_v7_positions"]))
             self.assertLess(max(abs(a - b) for a, b in zip(positions, scene["cb_v7_positions"])), 1e-6)
+            # `blend` deliberately changed in 2.0: it is measured against the conformed ground the
+            # object meets rather than the flat original, so it reaches 1 at the visible junction
+            # on the meniscus. Positions and normals above are unchanged. Check the new
+            # definition exactly: smoothstep falloff over Material Blend Distance of the distance
+            # to the joined ground copy (the object's own vertices come first in the join).
             blend = [d.value for d in me.attributes[cb.ATTR].data]
-            self.assertLess(max(abs(a - b) for a, b in zip(blend, scene["cb_v7_blend"])), 1e-6)
+            own = len(rock.data.vertices)
+            me.calc_loop_triangles()
+            tris = [t.vertices for t in me.loop_triangles if min(t.vertices) >= own]
+            bvh = BVHTree.FromPolygons([v.co for v in me.vertices], tris, all_triangles=True)
+            reach = cb.socket(mod, "Material Blend Distance")
+            for i in range(own):
+                x = min(bvh.find_nearest(me.vertices[i].co)[3] / reach, 1.0)
+                self.assertAlmostEqual(blend[i], 1 - x * x * (3 - 2 * x), delta=1e-4)
+            self.assertEqual(blend[own:], list(scene["cb_v7_blend"][own:]), "ground copy gained a blend")
+            self.assertGreater(max(blend[:own]) - max(scene["cb_v7_blend"][:own]), -1e-6)
             normals = [c for n in me.corner_normals for c in n.vector]
             self.assertLess(max(abs(a - b) for a, b in zip(normals, scene["cb_v7_normals"])), 1e-5)
         finally:

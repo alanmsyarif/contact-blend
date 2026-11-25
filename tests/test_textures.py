@@ -317,6 +317,78 @@ class TextureTests(unittest.TestCase):
                                        "Reference must contain a visible pattern")
                     self.assertEqual(bpy.ops.object.contact_blend_remove(), {"FINISHED"})
 
+    def test_ground_colour_reaches_the_visible_junction(self):
+        """Side view, emission only: just above where the object meets the conformed ground it
+        must already be the ground's colour, and at the top its own."""
+        def emission(mat, colour):
+            tree = mat.node_tree
+            tree.nodes.clear()
+            emit = tree.nodes.new("ShaderNodeEmission")
+            emit.inputs["Color"].default_value = colour
+            out = tree.nodes.new("ShaderNodeOutputMaterial")
+            tree.links.new(emit.outputs[0], out.inputs["Surface"])
+
+        bpy.data.objects.remove(self.target, do_unlink=True)
+        bpy.data.objects.remove(self.source, do_unlink=True)
+        bpy.ops.mesh.primitive_grid_add(size=4, x_subdivisions=80, y_subdivisions=80)
+        self.target = bpy.context.object
+        self.target.data.materials.append(bpy.data.materials["Ground"])
+        emission(bpy.data.materials["Ground"], (1, 0, 0, 1))
+        bpy.ops.mesh.primitive_uv_sphere_add(segments=64, ring_count=32, radius=0.5, location=(0, 0, 0.25))
+        self.source = bpy.context.object
+        bpy.ops.object.shade_smooth()
+        self.source.data.materials.append(bpy.data.materials["Hero"])
+        emission(bpy.data.materials["Hero"], (0, 0, 1, 1))
+        mod, ids = self.apply(ground=True)
+        # A wide conform under a narrow material band: the meniscus climbs higher, relative to
+        # Material Blend Distance, than the band reaches from the flat original.
+        mod[ids["Contact Distance"]] = 0.6
+        mod[ids["Material Blend Distance"]] = 0.15
+        mod[ids["Normal Blend Distance"]] = 0.1
+        self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
+        proxy = cb.find_proxy(self.target)
+        evaluated = proxy.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        mesh = evaluated.to_mesh()
+        # the meniscus top facing the camera, on the image's centre column
+        junction = max(v.co.z for v in mesh.vertices if abs(v.co.x) < 0.03 and v.co.y < 0)
+        evaluated.to_mesh_clear()
+        self.assertGreater(junction, 0.03, "no meniscus to measure against")
+
+        scene = bpy.context.scene
+        bpy.ops.object.camera_add(location=(0, -5, 0.3), rotation=(1.5707963, 0, 0))
+        scene.camera = bpy.context.object
+        scene.camera.data.type = "ORTHO"
+        scene.camera.data.ortho_scale = 1.6
+        scene.render.engine = "CYCLES"
+        scene.cycles.device = "CPU"
+        scene.cycles.samples = 1
+        scene.cycles.use_denoising = False
+        scene.cycles.filter_width = 0.01            # no bleed from the ground pixels below
+        scene.render.resolution_x = scene.render.resolution_y = size = 200
+        scene.render.resolution_percentage = 100
+        scene.view_settings.view_transform = "Standard"
+        scene.render.image_settings.file_format = "OPEN_EXR"
+        scene.render.image_settings.color_depth = "32"
+        with tempfile.TemporaryDirectory(prefix="contact-blend-junction-") as tmp:
+            path = pathlib.Path(tmp) / "junction.exr"
+            scene.render.filepath = str(path)
+            bpy.ops.render.render(write_still=True)
+            image = bpy.data.images.load(str(path), check_existing=False)
+            pixels = list(image.pixels)
+            bpy.data.images.remove(image)
+
+        def pixel(z):
+            """RGB at the centre column, height z (image rows run bottom-up)."""
+            row = int((z - (0.3 - 0.8)) / 1.6 * size)
+            i = (row * size + size // 2) * 4
+            return pixels[i:i + 3]
+
+        pixel_size = 1.6 / size
+        red, _, blue = pixel(junction + 2.5 * pixel_size)
+        self.assertGreater(red, 0.85, f"rock just above the junction is not ground-coloured ({red}, {blue})")
+        red, _, blue = pixel(0.7)
+        self.assertGreater(blue, 0.99, f"top of the rock is not its own colour ({red}, {blue})")
+
     def test_breakup_is_identity_by_default_and_never_moves_the_ends(self):
         """Render the breakup group's output straight to emission, compared to its input."""
         tree = self.source.active_material.node_tree

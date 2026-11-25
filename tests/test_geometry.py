@@ -10,6 +10,7 @@ import unittest
 
 import bpy
 from mathutils import Vector
+from mathutils.bvhtree import BVHTree
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import contact_blend as cb
@@ -287,10 +288,68 @@ class GeometryTests(unittest.TestCase):
         (b0, z0, n0), (b1, z1, n1) = results["Plain"], results["Scaled"]
         self.assertGreater(max(b0.values()), 0.9)
         self.assertEqual(b0.keys(), b1.keys(), "hero shapes do not match; test is broken")
-        self.assertLess(max(abs(b0[k] - b1[k]) for k in b0), 1e-4, "blend differs under scale")
+        # With Displace Ground on, blend is measured against the conformed ground, which each
+        # object computes in its own frame -- ten times larger coordinates for the scaled one --
+        # so float32 noise in the conform reaches it (about 4e-5 m of ground position here).
+        self.assertLess(max(abs(b0[k] - b1[k]) for k in b0), 5e-4, "blend differs under scale")
         self.assertLess(z0, -0.05)
         self.assertAlmostEqual(z0, z1, delta=1e-4)
         self.assertEqual(n0, n1, "contact island differs under scale")
+        # Against the raw target (Displace Ground off) nothing but the distance conversion is
+        # involved, and the two must agree as tightly as before.
+        raw = {}
+        for obj in (plain, scaled):
+            mod = cb.find_mod(obj)
+            cb.set_socket(mod, "Displace Ground", False)
+            obj.update_tag()
+        for obj in (plain, scaled):
+            mod = cb.find_mod(obj)
+            me = self.evaluated(obj)
+            self.assertEqual(len(me.vertices), len(obj.data.vertices))
+            raw[obj.name] = self.hero_blend(obj, me, mod, cb.input_ids(mod.node_group))
+        r0, r1 = raw["Plain"], raw["Scaled"]
+        self.assertGreater(max(r0.values()), 0.9)
+        self.assertLess(max(abs(r0[k] - r1[k]) for k in r0), 1e-4, "raw blend differs under scale")
+
+    def test_blend_is_measured_against_the_ground_as_drawn(self):
+        # A wide conform under a narrow material band: the meniscus climbs the flank higher than
+        # the band reaches from the flat original, so measuring there left the object its own
+        # colour right down to where it visibly meets the ground.
+        ground = grid("Ground", 4, 80)
+        self.material(ground, "Ground")
+        rock = self.sphere((0.03, 0.02, 0.25))
+        mod, ids = self.apply(rock, ground)
+        mod[ids["Contact Distance"]] = 0.6
+        mod[ids["Material Blend Distance"]] = reach = 0.15
+        mod[ids["Normal Blend Distance"]] = 0.1
+        rock.update_tag()
+        owner, gme, polys = self.ground_view(rock)
+        world = [owner.matrix_world @ v.co for v in gme.vertices]
+        tris = []
+        for p in polys:
+            vs = list(p.vertices)
+            tris += [(vs[0], vs[i], vs[i + 1]) for i in range(1, len(vs) - 1)]
+        bvh = BVHTree.FromPolygons(world, tris, all_triangles=True)
+        ground_verts = set() if self.SHARED else {i for p in polys for i in p.vertices}
+        # joined: the ground is inside the object's own evaluated mesh; a second to_mesh() of the
+        # same object would free the one `polys` came from
+        me = self.evaluated(rock) if self.SHARED else gme
+        values = me.attributes[cb.ATTR].data
+        touching = far = 0
+        for i, v in enumerate(me.vertices):
+            # Only what can be seen: below the original ground the rock is inside the crater,
+            # where a ground vertex equally near two of the rock's facets may land on either, so
+            # distances to the buried part of the ground are not reproducible from run to run.
+            if i in ground_verts or (rock.matrix_world @ v.co).z < 0.0:
+                continue
+            d = bvh.find_nearest(rock.matrix_world @ v.co)[3]
+            x = min(d / reach, 1.0)
+            self.assertAlmostEqual(values[i].value, 1 - x * x * (3 - 2 * x), delta=2e-3,
+                                   msg=f"vertex {i} at {d:.4f} m from the ground")
+            touching += d < 0.01
+            far += d > reach
+        self.assertGreater(touching, 10, "no vertex touches the ground; the test is not biting")
+        self.assertGreater(far, 10)
 
     def test_instanced_target_is_realized(self):
         ground = grid("Ground", 4, 40)

@@ -26,7 +26,7 @@ LEGACY_NAMES = ("Blend To Surface",)
 # number, so an existing .blend picks up fixes on reload instead of silently running the tree
 # it was first built with -- a stale group is indistinguishable from a bug that did not get
 # fixed, and telling people to delete it by hand is exactly how it survives.
-GROUP_VERSION = 8
+GROUP_VERSION = 9
 # The stamp moved with the rename. An old group carries the value under the old key, so read
 # both and rewrite to the current one -- treating the old key as unstamped would force a
 # needless rebuild, and the diagnostic would report a group of unknown vintage.
@@ -43,8 +43,9 @@ GROUND_GROUP = "Contact Blend Ground"
 # The ground group is stamped under its own key: _is_ours() treats anything carrying
 # VERSION_KEY as a hero group, and the two must never be mistaken for each other.
 GROUND_VERSION_KEY = "cb_ground_version"
-GROUND_VERSION = 1
+GROUND_VERSION = 2
 PARAMS_ATTR = "cb_params"
+NORMAL_ATTR = "cb_normal"
 PROXY_KEY = "cb_ground_proxy"
 HEROES_KEY = "cb_ground_objects"
 APPLIED_KEY = "cb_applied"
@@ -505,33 +506,21 @@ def _build_group(ng):
     detail_dist = local("Ground Detail", 500)
 
     raw = t.target(-1300, -260, g["Target"])
-    d_src, _ = t.proximity(-900, -260, raw)
-
-    # --- 'blend' attribute for mixing materials in the shader (1 at contact, 0 away) ---
-    store = t.node("GeometryNodeStoreNamedAttribute", -300, 0, data_type="FLOAT", domain="POINT")
-    store.inputs["Name"].default_value = ATTR
-    link(g["Geometry"], store.inputs["Geometry"])
-    link(t.ramp(-500, -700, d_src, material_dist, 1.0, 0.0), store.inputs["Value"])
-
-    # --- the settings the shared ground needs, carried on the geometry ---
-    # The ground proxy reads every hero through one Collection Info and cannot see their
-    # modifiers, yet a pebble and a boulder need different contact radii. So each hero writes
-    # its own (Contact Distance, conform weight, Surface Offset) onto its points, in WORLD
-    # metres: the proxy converts with its own scale. Displace Ground off zeroes the weight, so
-    # a hero that has opted out leaves the ground alone even before it leaves the collection.
-    weight = t.math(-500, 300, "MULTIPLY", g["Ground Conform"], g["Displace Ground"])
-    params = t.node("ShaderNodeCombineXYZ", -300, 300)
-    link(g["Contact Distance"], params.inputs[0])
-    link(weight, params.inputs[1])
-    link(g["Surface Offset"], params.inputs[2])
-    carry = t.node("GeometryNodeStoreNamedAttribute", -100, 0, data_type="FLOAT_VECTOR", domain="POINT")
-    carry.inputs["Name"].default_value = PARAMS_ATTR
-    link(store.outputs["Geometry"], carry.inputs["Geometry"])
-    link(params.outputs[0], carry.inputs["Value"])
-    src = carry.outputs["Geometry"]
-
-    d_tgt, p_tgt = t.proximity(0, -560, src)
-    sink_dir = t.sample(0, -760, src, t.nor)
+    # The conform measures against the object's own input geometry, not against `src` below:
+    # `blend` is measured against the conformed ground, so the ground must not depend on it.
+    # The shared ground and this object's patch both sink along the object's surface normal,
+    # stored per point: smooth across faces, so a ground vertex equally near two faces (under a
+    # pole, along a flat-shaded edge) gets one answer whichever face the nearest-surface search
+    # happens to report, and unaffected by the welded custom normals written at the end.
+    sinks = t.node("GeometryNodeStoreNamedAttribute", -300, -800, data_type="FLOAT_VECTOR", domain="POINT")
+    sinks.inputs["Name"].default_value = NORMAL_ATTR
+    link(g["Geometry"], sinks.inputs["Geometry"])
+    link(t.true_nor, sinks.inputs["Value"])
+    hero = sinks.outputs["Geometry"]
+    stored_normal = t.node("GeometryNodeInputNamedAttribute", -300, -900, data_type="FLOAT_VECTOR")
+    stored_normal.inputs["Name"].default_value = NORMAL_ATTR
+    d_tgt, p_tgt = t.proximity(0, -560, hero)
+    sink_dir = t.sample(0, -760, hero, t.nor)
     detail = (g["Detail Image"], g["Detail UV Map"], g["Detail Midlevel"], detail_dist)
 
     def conform(y, ground, sink):
@@ -541,13 +530,15 @@ def _build_group(ng):
     # Joined mode: the whole target, conformed, is joined into this object's output.
     full = conform(-900, raw, sink_dir)
     # Shared mode: the proxy draws the ground, but this object still has to weld its normals to,
-    # and project its UVs from, the ground it meets -- so conform just the patch of the target
-    # this object can see (anything farther than every blend distance never influences it) and
-    # sample from that. Nothing of the patch is output.
+    # measure its material blend against, and project its UVs from the ground it meets -- so
+    # conform just the patch of the target this object can see and sample from that. The patch
+    # reaches the largest of the three distances, so a ground point that could matter to any of
+    # them is in it (see _Tree.island). Nothing of the patch is output.
     reach = t.math(-300, -2700, "MAXIMUM", contact, t.math(-500, -2700, "MAXIMUM", normal_dist, material_dist))
     patch = t.island(-300, -2600, raw, d_tgt, reach)
-    # It sinks along the true normal, as the proxy does, so the two land on the same surface.
-    shared_ground = conform(-2900, patch.outputs["Selection"], t.sample(0, -2900, src, t.true_nor))
+    # It sinks along the stored normal, as the proxy does, so the two land on the same surface.
+    shared_ground = conform(-2900, patch.outputs["Selection"],
+                            t.sample(0, -2900, hero, stored_normal.outputs["Attribute"]))
     conformed = t.switch(3000, -1600, g["Shared Ground"], full, shared_ground)
 
     # What the hero's shading reads the ground from. With Displace Ground on, the conformed
@@ -556,6 +547,34 @@ def _build_group(ng):
     # raw target instead. Switch only evaluates the branch it picks, so with Displace Ground
     # off nothing of either conform pipeline is computed at all.
     shade_ref = t.switch(3100, -1700, g["Displace Ground"], raw, conformed)
+    d_ref = t.proximity(3000, -1250, shade_ref)[0]
+
+    # --- 'blend' attribute for mixing materials in the shader (1 at contact, 0 away) ---
+    # Measured against the ground as drawn. The visible junction is where the object meets the
+    # *conformed* ground, which has climbed its flank as a meniscus; measured against the flat
+    # original, blend is already near 0 up there and the object stays its own colour right down
+    # to the ground.
+    store = t.node("GeometryNodeStoreNamedAttribute", 3200, 0, data_type="FLOAT", domain="POINT")
+    store.inputs["Name"].default_value = ATTR
+    link(hero, store.inputs["Geometry"])
+    link(t.ramp(3000, -700, d_ref, material_dist, 1.0, 0.0), store.inputs["Value"])
+
+    # --- the settings the shared ground needs, carried on the geometry ---
+    # The ground proxy reads every hero through one Collection Info and cannot see their
+    # modifiers, yet a pebble and a boulder need different contact radii. So each hero writes
+    # its own (Contact Distance, conform weight, Surface Offset) onto its points, in WORLD
+    # metres: the proxy converts with its own scale. Displace Ground off zeroes the weight, so
+    # a hero that has opted out leaves the ground alone even before it leaves the collection.
+    weight = t.math(3000, 300, "MULTIPLY", g["Ground Conform"], g["Displace Ground"])
+    params = t.node("ShaderNodeCombineXYZ", 3100, 300)
+    link(g["Contact Distance"], params.inputs[0])
+    link(weight, params.inputs[1])
+    link(g["Surface Offset"], params.inputs[2])
+    carry = t.node("GeometryNodeStoreNamedAttribute", 3300, 0, data_type="FLOAT_VECTOR", domain="POINT")
+    carry.inputs["Name"].default_value = PARAMS_ATTR
+    link(store.outputs["Geometry"], carry.inputs["Geometry"])
+    link(params.outputs[0], carry.inputs["Value"])
+    src = carry.outputs["Geometry"]
 
     # Sample UVs from the conformed ground, whose original corner UVs have survived
     # subdivision and displacement. Sampling before the conform makes the two sides slide
@@ -578,8 +597,7 @@ def _build_group(ng):
     weld_n.capture_items.new("FLOAT", "weight")
     weld_n.capture_items.new("VECTOR", "normal")
     link(uv_src, weld_n.inputs["Geometry"])
-    link(t.ramp(3200, -1250, t.proximity(3000, -1250, shade_ref)[0], normal_dist, 1.0, 0.0),
-         weld_n.inputs["weight"])
+    link(t.ramp(3200, -1250, d_ref, normal_dist, 1.0, 0.0), weld_n.inputs["weight"])
     link(t.sample(3000, -1400, shade_ref, t.nor), weld_n.inputs["normal"])
     shaded_src = weld_n.outputs["Geometry"]
 
@@ -665,9 +683,11 @@ def _build_ground_group(ng):
     link(own.outputs[0], stat.inputs["Attribute"])
     island_radius = t.math(-500, 800, "DIVIDE", stat.outputs["Max"], scale)
 
-    # Sink along the objects' true surface normal: their output carries the welded custom
-    # normals, which near the contact point along the ground, not out of the object.
-    sink_dir = t.sample(-900, 900, heroes, t.true_nor)
+    # Sink along the normal each object stored for this (see _build_group): their output carries
+    # the welded custom normals, which near the contact point along the ground, not out of it.
+    stored = t.node("GeometryNodeInputNamedAttribute", -1100, 900, data_type="FLOAT_VECTOR")
+    stored.inputs["Name"].default_value = NORMAL_ATTR
+    sink_dir = t.sample(-900, 900, heroes, stored.outputs["Attribute"])
 
     dist, closest = t.proximity(-900, 100, heroes)
     detail = (g["Detail Image"], g["Detail UV Map"], g["Detail Midlevel"],

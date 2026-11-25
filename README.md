@@ -27,8 +27,10 @@ means hunting down and deleting old node groups.
 <details>
 <summary><b>Upgrading from 1.x</b></summary>
 
-Existing blends keep working exactly as they did: each object keeps drawing its own joined copy of
-the ground. The sidebar shows **Use Shared Ground** on such an object; press it to move every blend
+Existing blends keep their geometry and shading exactly: each object keeps drawing its own joined
+copy of the ground. One thing changes on load: the material cross-fade is now measured from where
+the object meets the conformed ground rather than the flat original, so the ground's material reaches
+up to the visible junction. The sidebar shows **Use Shared Ground** on such an object; press it to move every blend
 on that ground to one shared ground, so they stop cutting through each other's craters. Blending a
 new object into a ground that has joined blends converts them too, and says so. Settings are kept;
 undo reverts the conversion.
@@ -171,7 +173,7 @@ its average).
 | Setting | New blend | What it does |
 |---|---|---|
 | **Normal Blend** | ⅔ of Contact Distance | Over what distance the object's shading normals rotate to match the ground's. |
-| **Material Blend** | = Contact Distance | Over what distance the object's material fades into the ground's. |
+| **Material Blend** | = Contact Distance | Over what distance, measured from where the object meets the ground, its material fades into the ground's. |
 | **Match Target Textures** | on | Match UV, Object, and Generated coordinates in the copied ground shader. |
 | **Target UV Map** | ground's render UV | UV map to project onto the object. |
 | **Breakup / Sharpness / Noise Scale** | 0 / 0 / 5 | Edge breakup of the material cross-fade, stored on the material. |
@@ -209,9 +211,11 @@ ground's material displaces at render time. **Diagnose** writes a full report to
   distance, written on the corner domain so sharp edges elsewhere survive. To have a ground to weld
   to, each object conforms the small patch of ground it can see, with the same settings the shared
   ground uses, and samples normals and UVs from it.
-- **Materials cross-fade.** A `blend` attribute is stored per point, 1 at contact and 0 away. The
-  ground's shader tree is copied into each of the object's materials and mixed against it by that
-  attribute, through the Edge Breakup node.
+- **Materials cross-fade.** A `blend` attribute is stored per point: 1 where the object meets the
+  ground *as drawn* — the conformed ground, whose meniscus has climbed the object's flank — and 0
+  at Material Blend distance above it. (With Displace Ground off it is measured against the
+  original.) The ground's shader tree is copied into each of the object's materials and mixed
+  against it by that attribute, through the Edge Breakup node.
 - **Subdivision cannot crack.** Only faces that can come within reach of an object are subdivided,
   by a conservative per-face bound, so every vertex on the cut — including those subdivision adds —
   provably stays put. Detail displacement is masked by the same falloff.
@@ -227,7 +231,9 @@ The source comments carry the full reasoning, including the proof that the cut c
   the viewport keeps looking correct. Rebuild the height as `Subdivision` + `Displace` modifiers on
   the ground, or use Detail Height.
 - **Where two objects' contact bands meet**, each ground vertex follows the nearest object, so the
-  ground can step where objects with very different settings are close together. The subdivided
+  ground can fold into a steep sliver along the line where the nearest object changes — visible as
+  a bright speck when it catches the light inside a shadow. Keep Contact Distances from overlapping
+  between neighbours, or move them apart. The subdivided
   area around every object is sized by the largest Contact Distance on that ground.
 - **The object's welded shading is computed against its own patch.** Where two objects' contact
   bands overlap, an object's normals and projected UVs ignore the other's crater.
@@ -261,7 +267,7 @@ blender --background --python-exit-code 1 --python tests/test_shared.py
 ```
 
 ```
-OK  hero_moved=0.000000  ground dip=-0.0706 far=0.000000 subdiv=1681->7621  detail=0.2619
+OK  hero_moved=0.000000  ground dip=-0.0715 far=0.000000 subdiv=1681->7621  detail=0.2619
     blend=0.000..0.984  bent=576/1536  ground=7501
 ```
 
