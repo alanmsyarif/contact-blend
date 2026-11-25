@@ -98,15 +98,23 @@ class GeometryTests(unittest.TestCase):
         return obj, me, self.ground_polys(me, mod, cb.input_ids(mod.node_group))
 
     def evaluated(self, obj):
+        """An independent copy of `obj`'s evaluated mesh, removed after the test.
+
+        A copy, not to_mesh(): tests delete objects (removing the last blend deletes the shared
+        ground), and clearing to_mesh() on a deleted object's evaluated copy crashes 5.2.
+        """
         obj.update_tag()
-        ev = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
-        self.addCleanup(ev.to_mesh_clear)
-        return ev.to_mesh()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        me = bpy.data.meshes.new_from_object(obj.evaluated_get(depsgraph), preserve_all_data_layers=True,
+                                             depsgraph=depsgraph)
+        name = me.name
+        self.addCleanup(lambda: bpy.data.meshes.get(name) and bpy.data.meshes.remove(bpy.data.meshes[name]))
+        return me
 
     def ground_polys(self, me, mod, ids):
-        names = {m.name for m in (mod[ids["Target"]].data.materials) if m}
-        if mod[ids["Ground Material"]]:
-            names.add(mod[ids["Ground Material"]].name)
+        names = {m.name for m in (cb.socket(mod, "Target").data.materials) if m}
+        if cb.socket(mod, "Ground Material"):
+            names.add(cb.socket(mod, "Ground Material").name)
         idx = {i for i, m in enumerate(me.materials) if m and m.name in names}
         return [p for p in me.polygons if p.material_index in idx]
 
@@ -171,7 +179,7 @@ class GeometryTests(unittest.TestCase):
                if abs(pts[i].x) < 10 - 1e-4 and abs(pts[i].y) < 10 - 1e-4}
         self.assertTrue(cut, "no subdivision cut found; the test is not biting")
         self.assertLess(max(abs(pts[i].z) for i in cut), 1e-6, "a vertex on the cut moved")
-        contact = mod[ids["Contact Distance"]]
+        contact = cb.socket(mod, "Contact Distance")
         rock_centre = rock.matrix_world.translation
         for i in cut:
             self.assertGreater((pts[i] - rock_centre).length - 0.5, contact)
@@ -207,20 +215,25 @@ class GeometryTests(unittest.TestCase):
         self.material(rock, "Rock")
         mod, ids = self.apply(rock, ground)
         rock.contact_blend_displace = False
-        self.assertFalse(mod[ids["Displace Ground"]])
+        self.assertFalse(cb.socket(mod, "Displace Ground"))
         self.assertIsNone(cb.find_proxy(ground), "the shared ground outlived Displace Ground")
-        self.assertTrue(mod[ids["Match Target Textures"]])
+        self.assertTrue(cb.socket(mod, "Match Target Textures"))
         me = self.evaluated(rock)
         self.assertEqual(len(me.vertices), 8)
         uv = me.uv_layers[cb.TARGET_UV_ATTR].data
-        for loop in me.loops:
-            p = rock.matrix_world @ me.vertices[loop.vertex_index].co
-            expected = Vector((p.x / 4 + 0.5, p.y / 4 + 0.5))
-            self.assertLess((uv[loop.index].uv - expected).length, 1e-5)
+        for poly in me.polygons:
+            for index in poly.loop_indices:
+                p = rock.matrix_world @ me.vertices[me.loops[index].vertex_index].co
+                expected = Vector((p.x / 4 + 0.5, p.y / 4 + 0.5))
+                # above the plane the UVs continue across a vertical face at the ground's own
+                # rate (see _build_group); the plane's normal is +Z, the cube's faces are its own
+                own = rock.data.polygons[poly.index].normal
+                expected += Vector((own.x, own.y)) * max(p.z, 0.0) / 4
+                self.assertLess((uv[index].uv - expected).length, 1e-5)
         # The flat target's normal is +Z everywhere, so each corner's normal must be its own
         # normal swung towards +Z by the weld weight 1 - smoothstep(d / Normal Blend Distance),
         # d being the corner's height above or below the plane.
-        reach = mod[ids["Normal Blend Distance"]]
+        reach = cb.socket(mod, "Normal Blend Distance")
         own = {(p.index, i): p.normal.copy() for p in rock.data.polygons for i in p.loop_indices}
         welded = 0
         for poly in me.polygons:
@@ -245,10 +258,10 @@ class GeometryTests(unittest.TestCase):
 
         def cost(level):
             # the object's own socket: what its local patch would be cut with
-            mod[ids["Contact Subdivisions"]] = level
+            cb.set_socket(mod, "Contact Subdivisions", level)
             times = []
             for i in range(3):
-                mod[ids["Contact Distance"]] = 0.3 + 0.001 * i
+                cb.set_socket(mod, "Contact Distance", 0.3 + 0.001 * i)
                 rock.update_tag()
                 t0 = time.perf_counter()
                 bpy.context.evaluated_depsgraph_get().update()
@@ -271,9 +284,10 @@ class GeometryTests(unittest.TestCase):
             ground.hide_set(False)     # the first blend hid it, and hidden objects cannot be selected
             mod, ids = self.apply(obj, ground)
             # set explicitly, so this tests scale handling and not the fitted defaults
-            mod[ids["Contact Distance"]] = mod[ids["Material Blend Distance"]] = 0.3
-            mod[ids["Normal Blend Distance"]] = 0.2
-            mod[ids["Surface Offset"]] = 0.002
+            cb.set_socket(mod, "Contact Distance", 0.3)
+            cb.set_socket(mod, "Material Blend Distance", 0.3)
+            cb.set_socket(mod, "Normal Blend Distance", 0.2)
+            cb.set_socket(mod, "Surface Offset", 0.002)
             obj.update_tag()       # socket writes from Python do not tag; the UI would
         for obj in (plain, scaled):
             mod = cb.find_mod(obj)
@@ -319,9 +333,10 @@ class GeometryTests(unittest.TestCase):
         self.material(ground, "Ground")
         rock = self.sphere((0.03, 0.02, 0.25))
         mod, ids = self.apply(rock, ground)
-        mod[ids["Contact Distance"]] = 0.6
-        mod[ids["Material Blend Distance"]] = reach = 0.15
-        mod[ids["Normal Blend Distance"]] = 0.1
+        cb.set_socket(mod, "Contact Distance", 0.6)
+        reach = 0.15
+        cb.set_socket(mod, "Material Blend Distance", reach)
+        cb.set_socket(mod, "Normal Blend Distance", 0.1)
         rock.update_tag()
         owner, gme, polys = self.ground_view(rock)
         world = [owner.matrix_world @ v.co for v in gme.vertices]

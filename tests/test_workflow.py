@@ -77,13 +77,13 @@ class WorkflowTests(unittest.TestCase):
     def test_repeated_apply_updates_one_modifier(self):
         mod = self.apply()
         ids = cb.input_ids(mod.node_group)
-        mod[ids["Contact Distance"]] = 0.75
+        cb.set_socket(mod, "Contact Distance", 0.75)
         count = len(self.source.active_material.node_tree.nodes)
         for _ in range(3):
             self.activate(self.source)  # the existing target is hidden
             self.assertEqual(bpy.ops.object.contact_blend(), {"FINISHED"})
         self.assertEqual(len(self.source.modifiers), 1)
-        self.assertAlmostEqual(mod[ids["Contact Distance"]], 0.75)
+        self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), 0.75)
         self.assertEqual(len(self.source.active_material.node_tree.nodes), count)
 
     def test_refresh_changes_target_shader_and_keeps_source_edits(self):
@@ -166,7 +166,7 @@ class WorkflowTests(unittest.TestCase):
         mod = self.apply()
         other = self.mesh("New ground", (0, 1, 0, 1))
         self.activate(self.source)
-        mod[cb.input_ids(mod.node_group)["Target"]] = other
+        cb.set_socket(mod, "Target", other)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertFalse(self.target.hide_get())
         self.assertFalse(self.target.hide_render)
@@ -177,11 +177,11 @@ class WorkflowTests(unittest.TestCase):
 
     def test_disabling_ground_restores_target(self):
         mod = self.apply()
-        mod[cb.input_ids(mod.node_group)["Displace Ground"]] = False
+        cb.set_socket(mod, "Displace Ground", False)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertFalse(self.target.hide_get())
         self.assertFalse(self.target.hide_render)
-        mod[cb.input_ids(mod.node_group)["Displace Ground"]] = True
+        cb.set_socket(mod, "Displace Ground", True)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertTrue(self.target.hide_get())
         self.assertTrue(self.target.hide_render)
@@ -191,7 +191,7 @@ class WorkflowTests(unittest.TestCase):
         other = self.mesh("Other rock", (0, 1, 0, 1))
         mod = other.modifiers.new(cb.GROUP, "NODES")
         mod.node_group = cb.build_group()
-        mod[cb.input_ids(mod.node_group)["Target"]] = self.target
+        cb.set_socket(mod, "Target", self.target)
         self.activate(other)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.activate(self.source)
@@ -231,7 +231,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_remove_after_target_socket_is_cleared(self):
         mod = self.apply()
-        mod[cb.input_ids(mod.node_group)["Target"]] = None
+        cb.set_socket(mod, "Target", None)
         self.assertEqual(bpy.ops.object.contact_blend_remove(), {"FINISHED"})
         self.assertFalse(self.target.hide_get())
         self.assertFalse(self.target.hide_render)
@@ -475,7 +475,7 @@ class WorkflowTests(unittest.TestCase):
     def test_appended_blend_with_suffixed_group_is_found_and_upgraded(self):
         mod = self.apply()
         ids = cb.input_ids(mod.node_group)
-        mod[ids["Contact Distance"]] = 0.777
+        cb.set_socket(mod, "Contact Distance", 0.777)
         mod.node_group[cb.VERSION_KEY] = cb.GROUP_VERSION - 1
         with tempfile.TemporaryDirectory(prefix="contact-blend-test-") as directory:
             path = str(pathlib.Path(directory) / "library.blend")
@@ -495,7 +495,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(cb.build_group(), own, "new blends must keep using the existing group")
         self.assertEqual(cb.group_version(mod.node_group), cb.GROUP_VERSION, "stale group not upgraded")
         self.assertEqual(len(mod.node_group.nodes), n_nodes)
-        self.assertAlmostEqual(mod[cb.input_ids(mod.node_group)["Contact Distance"]], 0.777, places=5)
+        self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), 0.777, places=5)
         self.assertEqual(len(cb._our_groups()), 2, "groups were merged or lost")
         # the diagnostic must see it too
         if appended.name not in bpy.context.scene.collection.all_objects:
@@ -546,7 +546,7 @@ class WorkflowTests(unittest.TestCase):
     def test_target_outside_view_layer_does_not_break_ui_or_operators(self):
         mod = self.apply()
         loose = bpy.data.objects.new("Loose ground", self.target.data)   # in no scene at all
-        mod[cb.input_ids(mod.node_group)["Target"]] = loose
+        cb.set_socket(mod, "Target", loose)
         self.activate(self.source)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertTrue(loose.hide_render, "operator stopped before hiding from render")
@@ -573,29 +573,29 @@ class WorkflowTests(unittest.TestCase):
     def test_new_blend_fits_distances_to_object_size(self):
         for size, contact, offset in ((0.05, 0.05 / 3, 0.0002), (0.5, 0.5 / 3, 0.002), (20, 20 / 3, 0.05)):
             obj, mod, ids = self.fitted(size)
-            self.assertAlmostEqual(mod[ids["Contact Distance"]], contact, places=5)
-            self.assertAlmostEqual(mod[ids["Material Blend Distance"]], contact, places=5)
-            self.assertAlmostEqual(mod[ids["Normal Blend Distance"]], contact * 2 / 3, places=5)
-            self.assertAlmostEqual(mod[ids["Surface Offset"]], offset, places=6)
+            self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), contact, places=5)
+            self.assertAlmostEqual(cb.socket(mod, "Material Blend Distance"), contact, places=5)
+            self.assertAlmostEqual(cb.socket(mod, "Normal Blend Distance"), contact * 2 / 3, places=5)
+            self.assertAlmostEqual(cb.socket(mod, "Surface Offset"), offset, places=6)
             self.target.hide_set(False)
         # world size, not mesh size: a 1 m cube scaled 3x is a 3 m object
         obj, mod, ids = self.fitted(1)
         obj.scale = (3, 3, 3)
         self.assertEqual(bpy.ops.object.contact_blend_fit(), {"FINISHED"})
-        self.assertAlmostEqual(mod[ids["Contact Distance"]], 1.0, places=5)
+        self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), 1.0, places=5)
 
     def test_user_distances_survive_reapply_and_update_until_fit(self):
         obj, mod, ids = self.fitted(0.5)
-        mod[ids["Contact Distance"]] = 0.9
-        mod[ids["Surface Offset"]] = 0.01
+        cb.set_socket(mod, "Contact Distance", 0.9)
+        cb.set_socket(mod, "Surface Offset", 0.01)
         self.activate(obj)
         self.assertEqual(bpy.ops.object.contact_blend(), {"FINISHED"})
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
-        self.assertAlmostEqual(mod[ids["Contact Distance"]], 0.9, places=5)
-        self.assertAlmostEqual(mod[ids["Surface Offset"]], 0.01, places=5)
+        self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), 0.9, places=5)
+        self.assertAlmostEqual(cb.socket(mod, "Surface Offset"), 0.01, places=5)
         self.assertEqual(bpy.ops.object.contact_blend_fit(), {"FINISHED"})
-        self.assertAlmostEqual(mod[ids["Contact Distance"]], 0.5 / 3, places=5)
-        self.assertAlmostEqual(mod[ids["Surface Offset"]], 0.002, places=5)
+        self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), 0.5 / 3, places=5)
+        self.assertAlmostEqual(cb.socket(mod, "Surface Offset"), 0.002, places=5)
 
 
 if __name__ == "__main__":

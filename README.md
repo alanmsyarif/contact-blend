@@ -10,7 +10,7 @@ objects can sit on one ground: they all crater the same surface.
 
 | | |
 |---|---|
-| **Blender** | 4.5 LTS, 5.0, 5.1 |
+| **Blender** | 5.0 and later — tested on 5.1.2, 5.2.5 and 5.3.0; 5.0 is untested |
 | **Location** | `View3D > Sidebar (N) > Contact`, and `Object > Contact Blend` |
 | **Renderers** | EEVEE Next and Cycles |
 
@@ -206,7 +206,13 @@ ground's material displaces at render time. **Diagnose** writes a full report to
   ground, would be a dependency cycle. The shared ground breaks it: the objects read the original
   ground, and only the shared ground reads the objects, through a helper collection that is not
   shown in the scene. Each object writes its own Contact Distance, Ground Conform and Surface Offset
-  onto its geometry (`cb_params`), and the shared ground reads them from the nearest object.
+  onto its geometry (`cb_params`), so every object keeps its own contact band.
+- **Overlapping contacts blend instead of snapping.** Where two objects' bands overlap, each ground
+  vertex is pulled toward both, in proportions that favour the nearer one and become all of one
+  object's as the vertex reaches it — so the ground meets every object, and the line where one
+  object takes over from another is smooth rather than a fold. Objects close enough to interact are
+  put in separate *overlap groups*, worked out automatically and kept current as you move them;
+  the cost grows with the number of groups, not the number of objects.
 - **Shading is welded.** Near the contact each object adopts the ground's normals over Normal Blend
   distance, written on the corner domain so sharp edges elsewhere survive. To have a ground to weld
   to, each object conforms the small patch of ground it can see, with the same settings the shared
@@ -230,11 +236,6 @@ The source comments carry the full reasoning, including the proof that the cut c
   whole modifier stack, so the ground conforms to a surface that is then moved somewhere else, and
   the viewport keeps looking correct. Rebuild the height as `Subdivision` + `Displace` modifiers on
   the ground, or use Detail Height.
-- **Where two objects' contact bands meet**, each ground vertex follows the nearest object, so the
-  ground can fold into a steep sliver along the line where the nearest object changes — visible as
-  a bright speck when it catches the light inside a shadow. Keep Contact Distances from overlapping
-  between neighbours, or move them apart. The subdivided
-  area around every object is sized by the largest Contact Distance on that ground.
 - **The object's welded shading is computed against its own patch.** Where two objects' contact
   bands overlap, an object's normals and projected UVs ignore the other's crater.
 - **Meniscus smoothness is capped by ground resolution.** Subdivisions helps; the crater's silhouette

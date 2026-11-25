@@ -58,10 +58,18 @@ class SharedBase(unittest.TestCase):
         return cb.find_proxy(self.ground)
 
     def evaluated(self, obj):
+        """An independent copy of `obj`'s evaluated mesh, removed after the test.
+
+        A copy, not to_mesh(): tests delete objects (removing the last blend deletes the shared
+        ground), and clearing to_mesh() on a deleted object's evaluated copy crashes 5.2.
+        """
         obj.update_tag()
-        ev = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
-        self.addCleanup(ev.to_mesh_clear)
-        return ev.to_mesh()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        me = bpy.data.meshes.new_from_object(obj.evaluated_get(depsgraph), preserve_all_data_layers=True,
+                                             depsgraph=depsgraph)
+        name = me.name
+        self.addCleanup(lambda: bpy.data.meshes.get(name) and bpy.data.meshes.remove(bpy.data.meshes[name]))
+        return me
 
     def ground_points(self):
         proxy = cb.find_proxy(self.ground)
@@ -310,6 +318,137 @@ class SharedGroundTests(SharedBase):
         self.assertIsNotNone(cb.find_proxy(self.ground))
 
 
+class OverlapTests(SharedBase):
+    """Two objects whose contact bands overlap must not fold the ground between them."""
+
+    CELL = 8 / 80 / 4          # the test ground's cell, after the default two subdivisions
+
+    def pair(self, a, b):
+        """a, b: (x, radius, Contact Distance). Spheres sunk half their radius."""
+        rocks = []
+        for i, (x, radius, contact) in enumerate((a, b)):
+            bpy.ops.mesh.primitive_uv_sphere_add(segments=48, ring_count=24, radius=radius,
+                                                 location=(x, 0.013, radius * 0.5))
+            rocks.append(bpy.context.object)
+            rocks[-1].name = f"Rock{i}"
+            self.material(rocks[-1], f"Rock{i}")
+        self.blend(*rocks)
+        for obj, (_, _, contact) in zip(rocks, (a, b)):
+            cb.set_socket(cb.find_mod(obj), "Contact Distance", contact)
+            obj.update_tag()
+        self.select(rocks)
+        self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
+        return rocks
+
+    def buried(self, p, rocks):
+        return any((p - r.location).length < r.dimensions.x / 2 for r in rocks)
+
+    def check_unfolded(self, rocks):
+        me, pts = self.ground_points()
+        edges = collections.defaultdict(list)
+        for poly in me.polygons:
+            for key in poly.edge_keys:
+                edges[key].append(poly)
+        for key, faces in edges.items():
+            if len(faces) == 2 and not all(self.buried(f.center, rocks) for f in faces):
+                angle = faces[0].normal.angle(faces[1].normal, 0)
+                self.assertLess(angle, 1.5, f"folded ground at {tuple(faces[0].center)}")
+        stretch = max((pts[e.vertices[0]] - pts[e.vertices[1]]).length for e in me.edges) / self.CELL
+        self.assertLessEqual(stretch, 4.01, "an edge was stretched past the coarse cell: a sliver")
+        visible = [p.area for p in me.polygons if not self.buried(p.center, rocks)]
+        self.assertGreater(min(visible) / self.CELL ** 2, 0.01, "near-zero-area sliver")
+        for r in rocks:
+            self.assertLess(self.dip(pts, r, radius=r.dimensions.x / 2), -0.02, f"ground missed {r.name}")
+        # continuity: a tiny move of one object moves the ground by about as much, not a jump
+        before = list(pts)
+        rocks[1].location.x += 1e-4
+        me, pts = self.ground_points()
+        self.assertEqual(len(pts), len(before))
+        jump = max((a - b).length for a, b in zip(before, pts) if not self.buried(a, rocks))
+        self.assertLess(jump, 1e-3, f"ground jumped {jump} m for a 0.1 mm move")
+        groups = [cb.socket(cb.find_mod(r), "Ground Group") for r in rocks]
+        self.assertNotEqual(groups[0], groups[1], "overlapping objects share a group")
+
+    def test_same_radii(self):
+        self.check_unfolded(self.pair((-0.45, 0.4, 0.4), (0.45, 0.4, 0.4)))
+
+    def test_very_different_radii(self):
+        self.check_unfolded(self.pair((-0.9, 1.0, 0.8), (0.33, 0.15, 0.12)))
+
+    def test_touching(self):
+        self.check_unfolded(self.pair((-0.4, 0.4, 0.4), (0.4, 0.4, 0.4)))
+
+    def test_interpenetrating(self):
+        self.check_unfolded(self.pair((-0.3, 0.4, 0.4), (0.3, 0.4, 0.4)))
+
+    def test_separate_groups_reproduce_the_single_object_ground_exactly(self):
+        # Close enough to be put in different groups, too far for their (tripled) bands to meet:
+        # the grouped blend must give the very same ground as the object alone.
+        a, b = self.pair((-1.0, 0.4, 0.2), (1.6, 0.4, 0.2))
+        self.assertNotEqual(cb.socket(cb.find_mod(a), "Ground Group"), cb.socket(cb.find_mod(b), "Ground Group"))
+        _, pts = self.ground_points()
+        near_a = sorted(tuple(p) for p in pts if (p.xy - a.location.xy).length < 1.0)
+        self.assertEqual(bpy.ops.object.contact_blend_remove(object_name=b.name), {"FINISHED"})
+        _, pts = self.ground_points()
+        alone = sorted(tuple(p) for p in pts if (p.xy - a.location.xy).length < 1.0)
+        self.assertEqual(len(near_a), len(alone))
+        self.assertLess(max(max(abs(u - v) for u, v in zip(p, q)) for p, q in zip(near_a, alone)), 1e-6)
+
+    def test_moving_objects_together_regroups_them(self):
+        a, b = self.pair((-2.5, 0.3, 0.2), (2.5, 0.3, 0.2))
+        self.assertEqual(cb.socket(cb.find_mod(a), "Ground Group"), cb.socket(cb.find_mod(b), "Ground Group"))
+        b.location.x = -1.7
+        bpy.context.view_layer.update()      # the handler regroups on the move
+        self.assertNotEqual(cb.socket(cb.find_mod(a), "Ground Group"), cb.socket(cb.find_mod(b), "Ground Group"))
+        self.check_unfolded([a, b])
+
+
+class RoughObjectTests(SharedBase):
+    def test_ground_does_not_crumple_against_a_rough_scan(self):
+        """A rock that is rough at small scale -- as every photoscan is. Conforming to its exact
+        surface sent neighbouring ground vertices into different crevices and crumpled the
+        ground into shards with gaps at the junction; Contact Smoothing must prevent that."""
+        from mathutils.bvhtree import BVHTree
+        # a ground fine enough (1 cm, 2.5 mm subdivided) to follow centimetre-scale roughness
+        bpy.data.objects.remove(self.ground)
+        self.ground = grid("Ground", 2, 200)
+        self.material(self.ground, "Ground")
+        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=6, radius=0.3, location=(0.01, 0.02, 0.12))
+        rock = bpy.context.object
+        noise = bpy.data.textures.new("Roughness", "CLOUDS")
+        noise.noise_scale = 0.015
+        noise.noise_depth = 2
+        rough = rock.modifiers.new("Rough", "DISPLACE")
+        rough.texture = noise
+        rough.strength = 0.03
+        bpy.ops.object.modifier_apply(modifier=rough.name)
+        self.material(rock, "Rock")
+        proxy = self.blend(rock)
+        surface = BVHTree.FromObject(rock, bpy.context.evaluated_depsgraph_get())
+
+        def inside(p):
+            hit, normal, *_ = surface.find_nearest(p)
+            return (p - hit).dot(normal) < 0
+
+        def visible_folds():
+            proxy.update_tag()
+            bpy.context.view_layer.update()
+            me, _ = self.ground_points()
+            edges = collections.defaultdict(list)
+            for poly in me.polygons:
+                for key in poly.edge_keys:
+                    edges[key].append(poly)
+            return sum(1 for faces in edges.values() if len(faces) == 2
+                       and not all(inside(proxy.matrix_world @ f.center) for f in faces)
+                       and faces[0].normal.angle(faces[1].normal, 0) > 1.5708)
+
+        self.assertEqual(cb.socket(cb.ground_mod(proxy), "Contact Smoothing"), cb.SMOOTHING)
+        self.assertEqual(cb.socket(cb.find_mod(rock), "Contact Smoothing"), cb.SMOOTHING)
+        self.assertEqual(visible_folds(), 0, "the ground crumpled against the rough surface")
+        cb.set_socket(cb.ground_mod(proxy), "Contact Smoothing", 0)
+        self.assertGreater(visible_folds(), 10, "the test is not biting: no folds without smoothing")
+
+
 class ResolutionTests(SharedBase):
     def test_resolution_rules_and_labels(self):
         rock, pebble, stone = self.rock("Rock", -2, 0), self.rock("Pebble", 0, 0), self.rock("Stone", 2, 0)
@@ -386,60 +525,83 @@ class ResolutionTests(SharedBase):
 class LegacyTests(unittest.TestCase):
     FIXTURE = HERE / "fixtures" / "joined_v7.blend"
 
+    def evaluated(self, obj):
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        me = bpy.data.meshes.new_from_object(obj.evaluated_get(depsgraph), preserve_all_data_layers=True,
+                                             depsgraph=depsgraph)
+        name = me.name
+        self.addCleanup(lambda: bpy.data.meshes.get(name) and bpy.data.meshes.remove(bpy.data.meshes[name]))
+        return me
+
     def test_joined_v7_blend_evaluates_the_same_and_converts_cleanly(self):
-        bpy.ops.wm.open_mainfile(filepath=str(self.FIXTURE))
+        # Open with the upgrade held back, keep a working copy of the 1.x (v7) tree exactly as
+        # the file saved it, then let the upgrade run. Comparing the two on the Blender that is
+        # running isolates what this version changed: the fixture's stored v7 output only
+        # matches the Blender it was written with (5.3 samples a flat-shaded normal differently).
+        bpy.app.handlers.load_post.remove(cb._on_load)
+        try:
+            bpy.ops.wm.open_mainfile(filepath=str(self.FIXTURE))
+        finally:
+            bpy.app.handlers.load_post.append(cb._on_load)
         rock, ground = bpy.data.objects["Rock"], bpy.data.objects["Ground"]
+        mod = cb.find_mod(rock)
+        self.assertEqual(cb.group_version(mod.node_group), 7)
+        v7 = mod.node_group.copy()
+        del v7[cb.VERSION_KEY]
+        # no longer recognisable as ours, so nothing upgrades it
+        next(i for i in v7.interface.items_tree if i.name == "Contact Distance").name = "Contact Distance (v7)"
+        twin = rock.copy()
+        bpy.context.collection.objects.link(twin)
+        twin.modifiers[mod.name].node_group = v7
+        self.assertIsNone(cb.find_mod(twin))
+        cb._on_load(None)
         mod = cb.find_mod(rock)
         self.assertEqual(cb.group_version(mod.node_group), cb.GROUP_VERSION, "not upgraded on load")
         self.assertFalse(cb.is_shared(mod), "an old blend changed mode on its own")
         self.assertIsNone(cb.find_proxy(ground))
-        scene = bpy.context.scene
-        rock.update_tag()
-        ev = rock.evaluated_get(bpy.context.evaluated_depsgraph_get())
-        me = ev.to_mesh()
-        try:
-            positions = [c for v in me.vertices for c in v.co]
-            self.assertEqual(len(positions), len(scene["cb_v7_positions"]))
-            self.assertLess(max(abs(a - b) for a, b in zip(positions, scene["cb_v7_positions"])), 1e-6)
-            # `blend` deliberately changed in 2.0: it is measured against the conformed ground the
-            # object meets rather than the flat original, so it reaches 1 at the visible junction
-            # on the meniscus. Positions and normals above are unchanged. Check the new
-            # definition exactly: smoothstep falloff over Material Blend Distance of the distance
-            # to the joined ground copy (the object's own vertices come first in the join).
-            blend = [d.value for d in me.attributes[cb.ATTR].data]
-            own = len(rock.data.vertices)
-            me.calc_loop_triangles()
-            tris = [t.vertices for t in me.loop_triangles if min(t.vertices) >= own]
-            bvh = BVHTree.FromPolygons([v.co for v in me.vertices], tris, all_triangles=True)
-            reach = cb.socket(mod, "Material Blend Distance")
-            for i in range(own):
-                x = min(bvh.find_nearest(me.vertices[i].co)[3] / reach, 1.0)
-                self.assertAlmostEqual(blend[i], 1 - x * x * (3 - 2 * x), delta=1e-4)
-            self.assertEqual(blend[own:], list(scene["cb_v7_blend"][own:]), "ground copy gained a blend")
-            self.assertGreater(max(blend[:own]) - max(scene["cb_v7_blend"][:own]), -1e-6)
-            normals = [c for n in me.corner_normals for c in n.vector]
-            self.assertLess(max(abs(a - b) for a, b in zip(normals, scene["cb_v7_normals"])), 1e-5)
-        finally:
-            ev.to_mesh_clear()
+        me, old = self.evaluated(rock), self.evaluated(twin)
+        self.assertEqual(len(me.vertices), len(old.vertices))
+        worst = max((a.co - b.co).length for a, b in zip(me.vertices, old.vertices))
+        self.assertLess(worst, 1e-6, "the upgraded joined blend moved geometry")
+        worst = max((a.vector - b.vector).length for a, b in zip(me.corner_normals, old.corner_normals))
+        self.assertLess(worst, 1e-5, "the upgraded joined blend changed shading normals")
+        # `blend` deliberately changed in 2.0: it is measured against the conformed ground the
+        # object meets rather than the flat original, so it reaches 1 at the visible junction
+        # on the meniscus. Check the new definition exactly: smoothstep falloff over Material
+        # Blend Distance of the distance to the joined ground copy (the object's own vertices
+        # come first in the join).
+        blend = [d.value for d in me.attributes[cb.ATTR].data]
+        before = [d.value for d in old.attributes[cb.ATTR].data]
+        own = len(rock.data.vertices)
+        me.calc_loop_triangles()
+        tris = [t.vertices for t in me.loop_triangles if min(t.vertices) >= own]
+        bvh = BVHTree.FromPolygons([v.co for v in me.vertices], tris, all_triangles=True)
+        reach = cb.socket(mod, "Material Blend Distance")
+        for i in range(own):
+            x = min(bvh.find_nearest(me.vertices[i].co)[3] / reach, 1.0)
+            self.assertAlmostEqual(blend[i], 1 - x * x * (3 - 2 * x), delta=1e-4)
+        self.assertEqual(blend[own:], before[own:], "ground copy gained a blend")
+        self.assertGreater(max(blend[:own]) - max(before[:own]), -1e-6)
+        bpy.data.objects.remove(twin)
         # The joined copy, for comparison after conversion. The shared ground sinks along the
         # true normal rather than the smoothed one (see _build_ground_group), which tilts the
         # Surface Offset on a coarse object, so compare with that offset at zero: then the two
         # must be the same surface.
         ids = cb.input_ids(mod.node_group)
-        mod[ids["Surface Offset"]] = 0.0
+        cb.set_socket(mod, "Surface Offset", 0.0)
         rock.update_tag()
         ev = rock.evaluated_get(bpy.context.evaluated_depsgraph_get())
         own = len(rock.data.vertices)
         joined = [rock.matrix_world @ v.co for v in ev.to_mesh().vertices][own:]
         ev.to_mesh_clear()
-        settings = {k: mod[ids[k]] for k in ("Contact Distance", "Surface Offset", "Contact Subdivisions")}
+        settings = {k: cb.socket(mod, k) for k in ("Contact Distance", "Surface Offset", "Contact Subdivisions")}
 
         bpy.ops.object.select_all(action="DESELECT")
         rock.select_set(True)
         bpy.context.view_layer.objects.active = rock
         self.assertEqual(bpy.ops.object.contact_blend_share(), {"FINISHED"})
         self.assertTrue(cb.is_shared(mod))
-        self.assertEqual({k: mod[ids[k]] for k in settings}, settings, "conversion changed settings")
+        self.assertEqual({k: cb.socket(mod, k) for k in settings}, settings, "conversion changed settings")
         proxy = cb.find_proxy(ground)
         self.assertEqual(cb.socket(cb.ground_mod(proxy), "Contact Subdivisions"), settings["Contact Subdivisions"])
         rock.update_tag()
@@ -493,13 +655,13 @@ class PanelTests(SharedBase):
                          "Subdivisions"):
             self.assertIn(expected, texts)
         gmod = cb.ground_mod(proxy)
-        gkey = (gmod, cb.socket_key(gmod, "Contact Subdivisions"))
+        gkey = cb.socket_prop(gmod, "Contact Subdivisions")
         self.assertIn(gkey, rec.props(), "ground section does not edit the proxy")
         hmod = cb.find_mod(rock)
-        self.assertNotIn((hmod, cb.socket_key(hmod, "Contact Subdivisions")), rec.props())
+        self.assertNotIn(cb.socket_prop(hmod, "Contact Subdivisions"), rec.props())
         self.assertNotIn(cb.CONTACTBLEND_OT_share.bl_idname, rec.operators())
-        self.assertIn(("prop_search", (cb.find_mod(rock), cb.socket_key(cb.find_mod(rock), "Target"),
-                                       bpy.data, "objects"), {"text": "Target"}), rec.calls)
+        self.assertIn(("prop_search", (*cb.socket_prop(cb.find_mod(rock), "Target"), bpy.data, "objects"),
+                       {"text": "Target"}), rec.calls)
         self.assertIn(cb.CONTACTBLEND_OT_diagnose.bl_idname, rec.operators())
         # out of sync: a changed Target is named and Update is highlighted
         other = grid("Other", 2, 4)
@@ -517,7 +679,7 @@ class PanelTests(SharedBase):
         self.assertIn("Objects (1)", rec.texts())
         self.assertIn("Select Objects", rec.texts())
         self.assertIn(cb.CONTACTBLEND_OT_remove.bl_idname, rec.operators())
-        self.assertIn((cb.ground_mod(proxy), gkey[1]), rec.props())
+        self.assertIn(cb.socket_prop(cb.ground_mod(proxy), "Contact Subdivisions"), rec.props())
         # missing proxy
         bpy.data.objects.remove(proxy, do_unlink=True)
         self.select([rock])
@@ -530,13 +692,13 @@ class PanelTests(SharedBase):
         rec = self.draw()
         self.assertIn(cb.CONTACTBLEND_OT_share.bl_idname, rec.operators())
         hmod = cb.find_mod(rock)
-        self.assertIn((hmod, cb.socket_key(hmod, "Contact Subdivisions")), rec.props())
+        self.assertIn(cb.socket_prop(hmod, "Contact Subdivisions"), rec.props())
         # stale group: an upgrade prompt and no socket rows that might not exist
         mod = cb.find_mod(rock)
         mod.node_group[cb.VERSION_KEY] = cb.GROUP_VERSION - 1
         rec = self.draw()
         self.assertIn("Upgrade", rec.texts())
-        self.assertNotIn((mod, cb.socket_key(mod, "Contact Distance")), rec.props())
+        self.assertNotIn(cb.socket_prop(mod, "Contact Distance"), rec.props())
         cb.build_group()
         # target outside the view layer
         loose = bpy.data.objects.new("Loose", self.ground.data)

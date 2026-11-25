@@ -1,0 +1,4 @@
+
+# Poly Haven downloads for the demo scenes (rebuilt by demo/build_demos.py)
+demo/assets/
+*.blend1

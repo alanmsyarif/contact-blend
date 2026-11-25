@@ -49,18 +49,25 @@ def is_ours(ng):
         group_version(ng) is not None or "Contact Distance" in input_names(ng))
 
 
+def value(mod, ident, default=None):
+    """A modifier input by socket identifier: an ID property up to 5.1, RNA from 5.2."""
+    inputs = getattr(getattr(mod, "properties", None), "inputs", None)
+    if inputs is not None:
+        item = getattr(inputs, ident or "", None)
+        result = item.value if item is not None else None
+    else:
+        result = mod.get(ident) if ident else None
+    return default if result is None else result
+
+
 def find_mod(obj):
     return obj and next((m for m in obj.modifiers if m.type == "NODES"
                          and m.node_group and is_ours(m.node_group)), None)
 
 
 def node_tree(mat):
-    """Material.use_nodes is deprecated from 5.0, where every material uses nodes."""
-    if mat is None:
-        return None
-    if bpy.app.version >= (5, 0, 0):
-        return mat.node_tree
-    return mat.node_tree if mat.use_nodes else None
+    """Every material is a node material in 5.x; Material.use_nodes is deprecated."""
+    return mat.node_tree if mat is not None else None
 
 
 def is_hidden(obj):
@@ -83,7 +90,7 @@ def report(obj):
 
     ids = {i.name: i.identifier for i in mod.node_group.interface.items_tree
            if i.item_type == "SOCKET" and i.in_out == "INPUT"}
-    tgt = mod[ids["Target"]]
+    tgt = value(mod, ids["Target"])
     add(f"object   : {obj.name}")
     add(f"target   : {tgt.name if tgt else 'NONE  <-- modifier has no target'}")
     add(f"engine   : {bpy.context.scene.render.engine}")
@@ -92,10 +99,10 @@ def report(obj):
            if mod.node_group.name in LEGACY_NAMES else ""))
     add(f"group ver: {group_version(mod.node_group)}  nodes={len(mod.node_group.nodes)}"
         f"  sockets={len(ids)}")
-    if "Shared Ground" in ids and mod.get(ids["Shared Ground"]):
+    if "Shared Ground" in ids and value(mod, ids["Shared Ground"]):
         proxies = [o for o in bpy.data.objects if o.get(PROXY_KEY) and any(
             m.type == "NODES" and m.node_group and GROUND_VERSION_KEY in m.node_group
-            and m.get(next((i.identifier for i in m.node_group.interface.items_tree
+            and value(m, next((i.identifier for i in m.node_group.interface.items_tree
                             if i.item_type == "SOCKET" and i.name == "Target"), "")) == tgt
             for m in o.modifiers)]
         add("mode     : shared ground; " + (f"drawn by '{proxies[0].name}'" if proxies
@@ -122,7 +129,7 @@ def report(obj):
     #    viewport while the render still draws the original surface through the crater.
     add("")
     if tgt:
-        ground_on = mod[ids["Displace Ground"]]
+        ground_on = value(mod, ids["Displace Ground"])
         add(f"target visibility: eye_hidden={is_hidden(tgt)} hide_render={tgt.hide_render} "
             f"hide_viewport={tgt.hide_viewport}")
         add(f"Displace Ground  : {ground_on}")
@@ -153,7 +160,7 @@ def report(obj):
         if linked and method != "BUMP":
             add("  ^-- THIS MOVES THE GROUND AT RENDER TIME, BEHIND THE MODIFIER'S BACK.")
             add(f"      Compare its Scale against Contact Distance"
-                f" ({mod[ids['Contact Distance']]:.4f}); if it is larger, the blend is swamped.")
+                f" ({value(mod, ids['Contact Distance']):.4f}); if it is larger, the blend is swamped.")
             add("      Fix: rebuild the height as Subdivision + Displace modifiers on the")
             add("      target, above Contact Blend, and set this material to Bump Only.")
 
@@ -168,14 +175,14 @@ def report(obj):
         add(f"attribute '{ATTR}': present  domain={a.domain} range={min(vals):.3f}..{max(vals):.3f}")
         if max(vals) < 0.5:
             add(f"  ^-- never gets near 1. Material Blend Distance"
-                f" ({mod[ids['Material Blend Distance']]:.4f}) is too small for this object.")
+                f" ({value(mod, ids['Material Blend Distance']):.4f}) is too small for this object.")
     else:
         add(f"attribute '{ATTR}': MISSING from the evaluated mesh")
     add(f"evaluated mesh   : {len(me.vertices)} verts, {len(me.materials)} material slots "
         f"({', '.join(m.name if m else '-' for m in me.materials)})")
     if "Match Target Textures" in ids:
-        matching = mod.get(ids["Match Target Textures"], True)
-        add(f"texture matching : {matching}  target UV={mod.get(ids['Target UV Map'], '')!r}")
+        matching = value(mod, ids["Match Target Textures"], True)
+        add(f"texture matching : {matching}  target UV={value(mod, ids['Target UV Map'], '')!r}")
         if matching:
             add("projected UVs    : " + ("present" if "cb_target_uv" in me.uv_layers else "MISSING"))
 
@@ -204,7 +211,7 @@ def report(obj):
     #    background the moment one of them moves.
     add("")
     gmats = {m.name for m in (tgt.data.materials if tgt and tgt.data else []) if m}
-    mapped_ground = mod.get(ids["Ground Material"]) if "Ground Material" in ids else None
+    mapped_ground = value(mod, ids["Ground Material"]) if "Ground Material" in ids else None
     if mapped_ground:
         gmats.add(mapped_ground.name)
     gi = {i for i, m in enumerate(me.materials) if m and m.name in gmats}

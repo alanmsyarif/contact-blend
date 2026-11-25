@@ -4,7 +4,7 @@ bl_info = {
     "name": "Contact Blend",
     "author": "amsy",
     "version": (2, 0),
-    "blender": (4, 5, 0),
+    "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Contact, and Object > Contact Blend",
     "description": "Sink objects into a ground without booleans: one shared ground conforms to every object on it, with welded normals and a cross-faded material at each contact",
     "category": "Object",
@@ -26,7 +26,7 @@ LEGACY_NAMES = ("Blend To Surface",)
 # number, so an existing .blend picks up fixes on reload instead of silently running the tree
 # it was first built with -- a stale group is indistinguishable from a bug that did not get
 # fixed, and telling people to delete it by hand is exactly how it survives.
-GROUP_VERSION = 9
+GROUP_VERSION = 13
 # The stamp moved with the rename. An old group carries the value under the old key, so read
 # both and rewrite to the current one -- treating the old key as unstamped would force a
 # needless rebuild, and the diagnostic would report a group of unknown vintage.
@@ -43,9 +43,13 @@ GROUND_GROUP = "Contact Blend Ground"
 # The ground group is stamped under its own key: _is_ours() treats anything carrying
 # VERSION_KEY as a hero group, and the two must never be mistaken for each other.
 GROUND_VERSION_KEY = "cb_ground_version"
-GROUND_VERSION = 2
+GROUND_VERSION = 4
 PARAMS_ATTR = "cb_params"
 NORMAL_ATTR = "cb_normal"
+GROUP_ATTR = "cb_group"
+REACH_KEY = "cb_ground_reach"
+# Contact Smoothing for new blends: Blur Attribute iterations on the surface the ground conforms to.
+SMOOTHING = 8
 PROXY_KEY = "cb_ground_proxy"
 HEROES_KEY = "cb_ground_objects"
 APPLIED_KEY = "cb_applied"
@@ -106,23 +110,12 @@ def _our_groups():
 
 
 def node_tree(mat):
-    """The node tree that shades `mat`, or None if it is not a node material.
-
-    `Material.use_nodes` is deprecated from 5.0 -- every material is a node material there and
-    reading the flag only prints a warning (it goes away in 6.0). 4.5 still has materials
-    without nodes, so the flag still decides there.
-    """
-    if mat is None:
-        return None
-    if bpy.app.version >= (5, 0, 0):
-        return mat.node_tree
-    return mat.node_tree if mat.use_nodes else None
+    """The node tree that shades `mat`, or None. Every material is a node material in 5.x;
+    `Material.use_nodes` is deprecated and only prints a warning, so it is never read."""
+    return mat.node_tree if mat is not None else None
 
 
 def ensure_node_tree(mat):
-    """Turn `mat` into a node material if it is not one already, and return its tree."""
-    if bpy.app.version < (5, 0, 0) and not mat.use_nodes:
-        mat.use_nodes = True
     return mat.node_tree
 
 
@@ -164,20 +157,19 @@ def _rebuild(ng, build=None, stamp=None):
     """
     old = input_ids(ng)
     saved = [(obj.name, mod.name,
-              {n: mod[i] for n, i in old.items() if n != "Geometry" and i in mod})
+              {n: socket(mod, n) for n in old if n != "Geometry" and socket(mod, n) is not None})
              for obj, mod in _users(ng)]
     ng.nodes.clear()
     ng.interface.clear()
     (build or _build_group)(ng)
     (stamp or _stamp)(ng)
-    new = input_ids(ng)
     for obj_name, mod_name, vals in saved:
         mod = bpy.data.objects[obj_name].modifiers.get(mod_name)
         for name, v in vals.items():
-            if mod and name in new:
+            if mod:
                 try:
-                    mod[new[name]] = v
-                except (TypeError, ValueError):
+                    set_socket(mod, name, v)
+                except (TypeError, ValueError, AttributeError):
                     pass
         if mod:
             bpy.data.objects[obj_name].update_tag()
@@ -239,15 +231,14 @@ class _Tree:
         self.pos = self.node("GeometryNodeInputPosition", -1300, -460).outputs["Position"]
         normal = self.node("GeometryNodeInputNormal", -1300, -560)
         self.nor = normal.outputs["Normal"]
-        # The surface's own normal, ignoring custom normals. Missing on versions without the
-        # output; there Normal is the best available stand-in.
-        self.true_nor = normal.outputs.get("True Normal") or self.nor
+        # The surface's own normal, ignoring custom normals.
+        self.true_nor = normal.outputs["True Normal"]
 
     def node(self, ident, x, y, **props):
         return _node(self.ng, ident, x, y, **props)
 
     def feed(self, socket, value):
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float, tuple)):
             socket.default_value = value
         elif value is not None:
             self.link(value, socket)
@@ -291,6 +282,26 @@ class _Tree:
         self.link(self.pos, s.inputs["Sample Position"])
         return s.outputs["Value"]
 
+    def smoothed(self, x, y, geo, iterations):
+        """`geo` with its positions blurred `iterations` times over its own edges.
+
+        The ground conforms to the closest point on the object. A scanned rock is rough at
+        every scale, and on a rough surface the closest point jumps between bumps and into
+        crevices from one ground vertex to the next, so the conformed ground crumples into flat
+        shards with gaps between them right at the junction. Conforming to a smoothed copy of
+        the surface instead keeps neighbouring ground vertices on neighbouring surface points;
+        the ground then fills the small crevices, as real sand and soil do, and sits hidden
+        inside the rock where the smoothed surface runs inside it. Zero iterations is the
+        surface itself.
+        """
+        blur = self.node("GeometryNodeBlurAttribute", x, y - 200, data_type="FLOAT_VECTOR")
+        self.link(self.pos, blur.inputs["Value"])
+        self.feed(blur.inputs["Iterations"], iterations)
+        sp = self.node("GeometryNodeSetPosition", x + 200, y)
+        self.link(geo, sp.inputs["Geometry"])
+        self.link(blur.outputs["Value"], sp.inputs["Position"])
+        return sp.outputs["Geometry"]
+
     def self_scale(self, x, y):
         """This object's world scale as one number: mean of the absolute axes.
 
@@ -318,16 +329,14 @@ class _Tree:
         self.link(info.outputs["Geometry"], realize.inputs["Geometry"])
         return realize.outputs["Geometry"]
 
-    def island(self, x, y, geo, dist, radius):
-        """Separate the faces of `geo` that can come within `radius` of the object.
+    def reach(self, x, y, geo):
+        """Capture every face's reach r = half its perimeter. Returns (geometry, r field).
 
-        Let c be a face's vertex centroid and r = half its perimeter. Every corner v satisfies
-        |v - c| <= mean_j |v - v_j| <= r (any two corners are joined by a path along the boundary
-        no longer than half of it), and every other point of the face -- edge midpoints
-        included -- lies in the hull of the corners, so also within r of c. Distance to the
-        object is 1-Lipschitz, so d(p) >= d(c) - r for every point p on the face. A face is
-        selected when d(c) - r <= radius; a face left out therefore has d(p) > radius at every
-        point on it, including every vertex subdivision may later insert on its edges.
+        Let c be a face's vertex centroid. Every corner v satisfies |v - c| <= mean_j |v - v_j|
+        <= r (any two corners are joined by a path along the boundary no longer than half of it),
+        and every other point of the face -- edge midpoints included -- lies in the hull of the
+        corners, so also within r of c. Any distance to an object is 1-Lipschitz, so
+        d(p) >= d(c) - r for every point p on the face.
 
         r is mean edge length * corner count / 2. The edge length is captured on the edge
         domain first: evaluated in face context, Edge Vertices would hand back face-averaged
@@ -340,21 +349,108 @@ class _Tree:
         self.link(self.vmath(x, y - 200, "DISTANCE", ends.outputs["Position 1"], ends.outputs["Position 2"]),
                   edge_len.inputs["length"])
         corners = self.node("GeometryNodeInputMeshFaceNeighbors", x + 200, y - 200)
-        reach = self.math(x + 400, y - 150, "MULTIPLY",
-                          self.math(x + 400, y - 250, "MULTIPLY", edge_len.outputs["length"],
-                                    corners.outputs["Vertex Count"]), 0.5)
-        clear = self.math(x + 600, y - 100, "GREATER_THAN",
-                          self.math(x + 600, y - 200, "SUBTRACT", dist, reach), radius)
-        keep = self.node("FunctionNodeBooleanMath", x + 800, y - 100, operation="NOT")
-        self.link(clear, keep.inputs[0])
-        sep = self.node("GeometryNodeSeparateGeometry", x + 800, y, domain="FACE")
-        self.link(edge_len.outputs["Geometry"], sep.inputs["Geometry"])
-        self.link(keep.outputs[0], sep.inputs["Selection"])
+        r = self.math(x + 400, y - 150, "MULTIPLY",
+                      self.math(x + 400, y - 250, "MULTIPLY", edge_len.outputs["length"],
+                                corners.outputs["Vertex Count"]), 0.5)
+        return edge_len.outputs["Geometry"], r
+
+    def cut(self, x, y, geo, keep):
+        sep = self.node("GeometryNodeSeparateGeometry", x, y, domain="FACE")
+        self.link(geo, sep.inputs["Geometry"])
+        self.link(keep, sep.inputs["Selection"])
         return sep
+
+    def within(self, x, y, slack, limit):
+        """Boolean field: slack <= limit (written as NOT slack > limit)."""
+        keep = self.node("FunctionNodeBooleanMath", x, y, operation="NOT")
+        self.link(self.math(x - 200, y, "GREATER_THAN", slack, limit), keep.inputs[0])
+        return keep.outputs[0]
+
+    def island(self, x, y, geo, dist, radius):
+        """Separate the faces of `geo` that can come within `radius` of the object.
+
+        A face is selected when d(c) - r <= radius (see reach()); a face left out therefore has
+        d(p) > radius at every point on it, including every vertex subdivision may later insert
+        on its edges.
+        """
+        geo, r = self.reach(x, y, geo)
+        return self.cut(x + 800, y, geo, self.within(x + 600, y - 100, self.math(x + 400, y - 300, "SUBTRACT", dist, r), radius))
+
+    def subdivide(self, x, y, geo, level):
+        sub = self.node("GeometryNodeSubdivideMesh", x, y)
+        self.link(geo, sub.inputs["Mesh"])
+        self.link(level, sub.inputs["Level"])
+        return sub.outputs["Mesh"]
+
+    def detail(self, x, y, geo, mask, detail):
+        """Contact-zone height: (image - midlevel) * height * mask, along the normal.
+
+        Subdividing the contact island and then not putting anything in it wastes the density:
+        it only smooths the crater. Displace here instead of over the whole ground, masked by
+        the same falloff as the conform so it is zero wherever the conform is -- strictly
+        inside the island, so the cut still cannot tear. Callers run this BEFORE the conform:
+        the conform has to be the last thing that touches these positions, or the height would
+        push the ground back off the object it just hugged.
+        """
+        image, uv_name, midlevel, height = detail
+        uv = self.node("GeometryNodeInputNamedAttribute", x, y - 400, data_type="FLOAT_VECTOR")
+        self.link(uv_name, uv.inputs["Name"])
+        img = self.node("GeometryNodeImageTexture", x + 200, y - 400)
+        self.link(image, img.inputs["Image"])
+        self.link(uv.outputs["Attribute"], img.inputs["Vector"])
+        # Midlevel defaults to 0 so an unset image, which samples as black, displaces by nothing.
+        h = self.node("ShaderNodeMath", x + 400, y - 400, operation="SUBTRACT")
+        self.link(img.outputs["Color"], h.inputs[0])
+        self.link(midlevel, h.inputs[1])
+        amt = self.math(x + 600, y - 400, "MULTIPLY", h.outputs["Value"], height)
+        amt = self.math(x + 800, y - 400, "MULTIPLY", amt, mask)
+        sp = self.node("GeometryNodeSetPosition", x + 1000, y)
+        self.link(geo, sp.inputs["Geometry"])
+        self.link(self.vmath(x + 800, y - 200, "SCALE", self.nor, scale=amt), sp.inputs["Offset"])
+        return sp.outputs["Geometry"]
+
+    def rejoin(self, x, y, rest, moved):
+        """Join the moved island back to the untouched remainder and weld the cut.
+
+        Separate Geometry duplicates the vertices along the cut, which splits their normals and
+        would draw a crease ring on any ground that is not dead flat. Weld them back -- but only
+        vertices on an open edge: every cut vertex is on one on both sides of the join (plus the
+        ground's own rim, which is harmless to include), and merging the whole floor would cost
+        a KD-tree over every vertex of it. The cut vertices are frozen, so both copies are still
+        bit-identical and the tiny distance is enough.
+
+        Deliberately no Set Shade Smooth anywhere. Forcing the bent faces smooth hides faceting
+        on a coarse ground, but it also flips shading mode at the cut: a hard crease ring on any
+        ground with real surface detail. Contact Subdivisions fixes the faceting at its source.
+        """
+        dense = self.node("GeometryNodeJoinGeometry", x, y)
+        self.link(rest, dense.inputs["Geometry"])
+        self.link(moved, dense.inputs["Geometry"])
+        open_edges = self.node("GeometryNodeInputMeshEdgeNeighbors", x, y - 200)
+        is_open = self.math(x, y - 300, "COMPARE", open_edges.outputs["Face Count"], 1.0)
+        is_open.node.inputs[2].default_value = 0.5
+        cut = self.node("GeometryNodeCaptureAttribute", x + 200, y, domain="EDGE")
+        cut.capture_items.new("BOOLEAN", "open")
+        self.link(dense.outputs["Geometry"], cut.inputs["Geometry"])
+        self.link(is_open, cut.inputs["open"])
+        weld = self.node("GeometryNodeMergeByDistance", x + 400, y)
+        self.link(cut.outputs["Geometry"], weld.inputs["Geometry"])
+        # Booleans adapt edge -> point with OR, so a vertex is selected if any of its edges is open.
+        self.link(cut.outputs["open"], weld.inputs["Selection"])
+        weld.inputs["Distance"].default_value = 1e-5
+        return weld.outputs["Geometry"]
+
+    def goal_offset(self, x, y, closest, sink_dir, offset):
+        """Where a ground vertex wants to go: the closest point on the object, Surface Offset
+        *inside* it, so the ground is buried instead of coplanar -- coplanar would z-fight along
+        the whole contact band. Returned as an offset from the vertex's own position."""
+        sink = self.vmath(x, y, "SCALE", sink_dir, scale=offset)
+        goal = self.vmath(x + 200, y, "SUBTRACT", closest, sink)
+        return self.vmath(x + 400, y, "SUBTRACT", goal, self.pos)
 
     def conform(self, x, y, raw, dist, closest, radius, island_radius, conform, offset, sink_dir,
                 level, detail):
-        """Conform `raw` (the ground) to the object(s) that `dist`/`closest` measure against.
+        """Conform `raw` (the ground) to the one object that `dist`/`closest` measure against.
 
         The seam is the curve where the two surfaces cross, so the only way to remove it is to
         stop them crossing. Deforming the object cannot do that -- pushing its contact band onto
@@ -367,84 +463,234 @@ class _Tree:
         contact island is subdivided. That leaves T-junctions along the cut, and a T-junction
         cracks open the moment either end of the edge it sits on moves -- so the cut has to fall
         strictly outside the moving zone, new midpoints on it included. island() guarantees
-        every point of a face left out has d > island_radius; with radius <= island_radius at
-        every point, the conform weight and the detail mask there are exactly 0 (the ramp is
-        clamped at its far end). So every vertex on the cut is frozen, and equivalently any
-        vertex that can move has all of its faces in the island.
-
-        `radius`, `conform` and `offset` may be fields (the shared ground samples them per vertex
-        from the nearest object); `island_radius` must bound `radius` from above everywhere.
-        Everything that moves the ground runs on the island alone: the remainder is provably
-        never moved, so evaluating proximity for every vertex of a half-million-vertex floor
+        every point of a face left out has d > island_radius >= radius, where the conform weight
+        and the detail mask are exactly 0 (the ramp is clamped at its far end). So every vertex
+        on the cut is frozen; equivalently any vertex that can move has all its faces in the
+        island. Everything that moves the ground runs on the island alone: the remainder is
+        provably never moved, so evaluating it for every vertex of a half-million-vertex floor
         only to multiply the result by zero is pure cost.
         """
         # A zero radius would make the ramp divide by zero and report "at contact" everywhere.
         radius = self.math(x, y + 200, "MAXIMUM", radius, 1e-6)
         island_radius = self.math(x, y + 100, "MAXIMUM", island_radius, 1e-6)
         sep = self.island(x, y, raw, dist, island_radius)
-        sub = self.node("GeometryNodeSubdivideMesh", x + 1000, y)
-        self.link(sep.outputs["Selection"], sub.inputs["Mesh"])
-        self.link(level, sub.inputs["Level"])
-
-        # --- real height, but only where there are vertices to carry it ---
-        # Subdividing the contact island and then not putting anything in it wastes the density:
-        # it only smooths the crater. Displace here instead of over the whole ground, masked by
-        # the same falloff so it is zero at the radius -- strictly inside the island, so the cut
-        # still cannot tear. This runs BEFORE the conform: the conform has to be the last thing
-        # that touches these positions, or the height would push the ground back off the object.
-        image, uv_name, midlevel, height = detail
-        uv = self.node("GeometryNodeInputNamedAttribute", x + 800, y - 400, data_type="FLOAT_VECTOR")
-        self.link(uv_name, uv.inputs["Name"])
-        img = self.node("GeometryNodeImageTexture", x + 1000, y - 400)
-        self.link(image, img.inputs["Image"])
-        self.link(uv.outputs["Attribute"], img.inputs["Vector"])
-        # Midlevel defaults to 0 so an unset image, which samples as black, displaces by nothing.
-        h = self.node("ShaderNodeMath", x + 1200, y - 400, operation="SUBTRACT")
-        self.link(img.outputs["Color"], h.inputs[0])
-        self.link(midlevel, h.inputs[1])
-        amt = self.math(x + 1400, y - 400, "MULTIPLY", h.outputs["Value"], height)
-        amt = self.math(x + 1600, y - 400, "MULTIPLY", amt, self.ramp(x + 1400, y - 600, dist, radius, 1.0, 0.0))
-        detail_sp = self.node("GeometryNodeSetPosition", x + 1800, y)
-        self.link(sub.outputs["Mesh"], detail_sp.inputs["Geometry"])
-        self.link(self.vmath(x + 1600, y - 200, "SCALE", self.nor, scale=amt), detail_sp.inputs["Offset"])
-
+        sub = self.subdivide(x + 1000, y, sep.outputs["Selection"], level)
+        displaced = self.detail(x + 1200, y, sub, self.ramp(x + 1000, y - 600, dist, radius, 1.0, 0.0), detail)
         w = self.ramp(x + 1600, y + 300, dist, radius, conform, 0.0)
-        # Land slightly *inside* the object rather than exactly on it, so the conformed ground is
-        # buried instead of coplanar -- coplanar would z-fight along the whole contact band.
-        sink = self.vmath(x + 1600, y + 200, "SCALE", sink_dir, scale=offset)
-        goal = self.vmath(x + 1800, y + 200, "SUBTRACT", closest, sink)
         move = self.vmath(x + 2000, y + 200, "SCALE",
-                          self.vmath(x + 2000, y + 300, "SUBTRACT", goal, self.pos), scale=w)
+                          self.goal_offset(x + 1600, y + 200, closest, sink_dir, offset), scale=w)
         sp = self.node("GeometryNodeSetPosition", x + 2200, y)
-        self.link(detail_sp.outputs["Geometry"], sp.inputs["Geometry"])
+        self.link(displaced, sp.inputs["Geometry"])
         self.link(move, sp.inputs["Offset"])
-        # Deliberately no Set Shade Smooth here. Forcing the bent faces smooth hides faceting on
-        # a coarse ground, but it also flips shading mode at exactly the radius: smooth inside,
-        # whatever the ground already was outside -- a hard crease ring on any ground with real
-        # surface detail. Contact Subdivisions fixes the faceting at its source instead.
+        return self.rejoin(x + 2400, y, sep.outputs["Inverted"], sp.outputs["Geometry"])
 
-        dense = self.node("GeometryNodeJoinGeometry", x + 2400, y)
-        self.link(sep.outputs["Inverted"], dense.inputs["Geometry"])
-        self.link(sp.outputs["Geometry"], dense.inputs["Geometry"])
-        # Separate Geometry duplicates the vertices along the cut, which splits their normals and
-        # would draw a crease ring on any ground that is not dead flat. Weld them back -- but only
-        # vertices on an open edge: every cut vertex is on one on both sides of the join (plus the
-        # ground's own rim, which is harmless to include), and merging the whole floor would cost
-        # a KD-tree over every vertex of it. The cut vertices are frozen, so both copies are still
-        # bit-identical and the tiny distance is enough.
-        open_edges = self.node("GeometryNodeInputMeshEdgeNeighbors", x + 2400, y - 200)
-        is_open = self.math(x + 2400, y - 300, "COMPARE", open_edges.outputs["Face Count"], 1.0)
-        is_open.node.inputs[2].default_value = 0.5
-        cut = self.node("GeometryNodeCaptureAttribute", x + 2600, y, domain="EDGE")
-        cut.capture_items.new("BOOLEAN", "open")
-        self.link(dense.outputs["Geometry"], cut.inputs["Geometry"])
-        self.link(is_open, cut.inputs["open"])
-        weld = self.node("GeometryNodeMergeByDistance", x + 2800, y)
-        self.link(cut.outputs["Geometry"], weld.inputs["Geometry"])
-        # Booleans adapt edge -> point with OR, so a vertex is selected if any of its edges is open.
-        self.link(cut.outputs["open"], weld.inputs["Selection"])
-        weld.inputs["Distance"].default_value = 1e-5
-        return weld.outputs["Geometry"]
+    # --- the shared ground: several objects, per-object distances --------------------------
+
+    def named(self, x, y, name, data_type="FLOAT"):
+        n = self.node("GeometryNodeInputNamedAttribute", x, y, data_type=data_type)
+        n.inputs["Name"].default_value = name
+        return n.outputs["Attribute"]
+
+    def store(self, x, y, geo, name, value, data_type="FLOAT", domain="POINT"):
+        n = self.node("GeometryNodeStoreNamedAttribute", x, y, data_type=data_type, domain=domain)
+        n.inputs["Name"].default_value = name
+        self.link(geo, n.inputs["Geometry"])
+        self.feed(n.inputs["Value"], value)
+        return n.outputs["Geometry"]
+
+    def repeat(self, x, y, geo, count, body):
+        """geo -> body(geo, iteration) -> ... `count` times. Returns the final geometry."""
+        rin = self.node("GeometryNodeRepeatInput", x, y)
+        rout = self.node("GeometryNodeRepeatOutput", x + 1600, y)
+        rin.pair_with_output(rout)
+        self.link(geo, rin.inputs["Geometry"])
+        self.feed(rin.inputs["Iterations"], count)
+        self.link(body(rin.outputs["Geometry"], rin.outputs["Iteration"]), rout.inputs["Geometry"])
+        return rout.outputs["Geometry"]
+
+    def group_query(self, x, y, heroes, group, scale):
+        """Everything about the nearest object of overlap group `group`, at each point:
+        (valid, distance, closest point, radius, conform, offset, sink direction), local units."""
+        member = self.named(x, y + 200, GROUP_ATTR, "INT")
+        p = self.node("GeometryNodeProximity", x + 200, y, target_element="FACES")
+        self.link(heroes, p.inputs["Geometry"])
+        self.link(member, p.inputs["Group ID"])
+        self.link(self.pos, p.inputs["Sample Position"])
+        self.link(group, p.inputs["Sample Group ID"])
+
+        def sample(yy, name):
+            s = self.node("GeometryNodeSampleNearestSurface", x + 200, yy, data_type="FLOAT_VECTOR")
+            self.link(heroes, s.inputs["Mesh"])
+            self.link(self.named(x, yy, name, "FLOAT_VECTOR"), s.inputs["Value"])
+            self.link(member, s.inputs["Group ID"])
+            self.link(self.pos, s.inputs["Sample Position"])
+            self.link(group, s.inputs["Sample Group ID"])
+            return s.outputs["Value"]
+
+        params = self.node("ShaderNodeSeparateXYZ", x + 400, y - 200)
+        self.link(sample(y - 200, PARAMS_ATTR), params.inputs[0])
+        radius = self.math(x + 600, y - 200, "MAXIMUM",
+                           self.math(x + 600, y - 300, "DIVIDE", params.outputs[0], scale), 1e-6)
+        offset = self.math(x + 600, y - 400, "DIVIDE", params.outputs[2], scale)
+        return (p.outputs["Is Valid"], p.outputs["Distance"], p.outputs["Position"], radius,
+                params.outputs[1], offset, sample(y - 500, NORMAL_ATTR))
+
+    def conform_groups(self, x, y, raw, heroes, scale, level, detail):
+        """Conform `raw` to every object in `heroes` at once, continuously where they overlap.
+
+        Conforming each ground vertex to its single nearest object folds the ground wherever two
+        objects' contact bands overlap: on one side of the line where the nearest object changes
+        a vertex slides onto one object, on the other side onto the other, and the cell between
+        them is stretched into a steep sliver. Each object's pull has to fade out where another
+        takes over instead.
+
+        Objects are split into overlap groups (assign_groups()), and for each group k every
+        vertex gets the nearest object of that group: distance d_k, closest point p_k, radius
+        R_k, conform c_k, Surface Offset o_k, sink normal n_k. Its single-object pull is
+
+            w_k (g_k - x),   w_k = c_k (1 - smoothstep(d_k / R_k)),   g_k = p_k - o_k n_k,
+
+        and the pulls are blended with an inverse-distance partition of unity over the nearest
+        object of every group whose band, tripled, reaches the vertex:
+
+            psi_k = m_k / (d_k^2 + eps_k^2),   delta = sum_k (psi_k / sum_j psi_j) w_k (g_k - x),
+
+        where m_k is 1 within R_k and fades smoothly to 0 at 3 R_k. Beyond three times its radius
+        an object has no say at all, so objects whose tripled bands do not meet each get exactly
+        the single-object result. The fade is that long because the pull it holds back can be a
+        much larger neighbour's: with a 2 R_k fade, a boulder still piled the ground up into a
+        near-vertical wall just past a pebble's share.
+
+        eps_k = R_k / 1000, and d_k is taken as 0 for a vertex *inside* object k ((x - p_k) . n_k
+        < 0): ground buried in an object belongs to it alone, or a neighbour would make its crater
+        shallower. That is still continuous: d_k is 0 at the surface from both sides.
+        With one object the share is psi / psi = 1 exactly, so this is the
+        single-object conform. Where two bands overlap the vertex goes to a blend of both pulls,
+        so nothing snaps. As a vertex reaches object k (d_k -> 0) its share tends to 1, so the
+        ground lands on every object even inside a larger neighbour's band. And the shares come
+        from distance, not from the weights: a pebble sitting in a boulder's wide band keeps
+        dominance just past its own small band, so the boulder cannot drag those vertices
+        sideways across the ones the pebble holds -- which is exactly how weight-based shares
+        (or the boulder's pull alone) fold the ground beside the pebble.
+
+        Continuity: d_k is the distance to a set, so it and psi_k are continuous everywhere; w_k,
+        p_k and the settings are continuous as long as the object behind them does not change.
+        Within a group that only happens where two members are equally near, and
+        assign_groups() keeps members of one group at least 6 max(R_i, R_j) + 4 r_max apart
+        (r_max: the largest face reach on the ground), so at that point d_k >= 3 max(R_i, R_j)
+        and w_k and m_k are 0 on both sides. delta -> 0 as every w_k -> 0, since it is a convex blend of terms bounded by
+        w_k |g_k - x|.
+
+        Island, per object with its OWN radius: a face is in the island when, for some group,
+        d_k(c) - r <= R_k(c). For a face left out and any point p on it, if p's nearest member
+        of group k is the same object i as c's, d_i(p) >= d_i(c) - r > R_i; if it is another
+        member j, then (from d_i(c) <= d_j(c) and the separation above) d_j(p) >= gap/2 - 2r > R_j.
+        Either way every w_k(p) and every detail mask term is exactly 0 on the face, so every
+        vertex on the cut is frozen and the subdivision T-junctions cannot crack.
+
+        Cost: one union Proximity over the whole ground (as before) rules out every face farther
+        than the largest radius from all objects; everything else -- the per-group island test,
+        the detail mask and the conform -- runs only on what is left, once per group. Groups are
+        few (objects whose bands can meet), so this is proportional to contact area, not to
+        objects x ground.
+        """
+        groups = self.math(x, y + 600, "ADD",
+                           self.attribute_max(x - 400, y + 600, heroes, GROUP_ATTR, "INT"), 1.0)
+        params = self.node("ShaderNodeSeparateXYZ", x - 400, y + 400)
+        self.link(self.named(x - 600, y + 400, PARAMS_ATTR, "FLOAT_VECTOR"), params.inputs[0])
+        largest = self.math(x - 200, y + 400, "DIVIDE",
+                            self.stat_max(x - 200, y + 300, heroes, params.outputs[0]), scale)
+        union = self.proximity(x - 400, y + 200, heroes)[0]
+        geo, r = self.reach(x, y, raw)
+        candidates = self.cut(x + 800, y, geo, self.within(x + 600, y - 100,
+                                                           self.math(x + 400, y - 300, "SUBTRACT", union, r), largest))
+
+        big = 1e30
+        band = self.store(x + 1000, y, candidates.outputs["Selection"], "cb_tmp_band", big, domain="FACE")
+
+        def band_body(g, k):
+            valid, d, _, radius, _, _, _ = self.group_query(x + 1200, y - 800, heroes, k, scale)
+            slack = self.switch(x + 2000, y - 800, valid, big,
+                                self.math(x + 1800, y - 800, "SUBTRACT", d, radius), kind="FLOAT")
+            return self.store(x + 2200, y, g, "cb_tmp_band",
+                              self.math(x + 2200, y - 600, "MINIMUM", self.named(x + 2000, y - 600, "cb_tmp_band"), slack),
+                              domain="FACE")
+
+        banded = self.repeat(x + 1100, y, band, groups, band_body)
+        island = self.cut(x + 3000, y, banded, self.within(
+            x + 2800, y - 100, self.math(x + 2600, y - 300, "SUBTRACT", self.named(x + 2400, y - 300, "cb_tmp_band"), r), 0.0))
+        rest = self.node("GeometryNodeJoinGeometry", x + 3200, y + 300)
+        self.link(candidates.outputs["Inverted"], rest.inputs["Geometry"])
+        self.link(island.outputs["Inverted"], rest.inputs["Geometry"])
+        sub = self.subdivide(x + 3200, y, island.outputs["Selection"], level)
+
+        # Detail height, masked by the strongest band at each point. The whole mask pass is
+        # skipped when there is no detail to apply (Switch evaluates only its chosen branch).
+        def mask_body(g, k):
+            valid, d, _, radius, _, _, _ = self.group_query(x + 3600, y - 1600, heroes, k, scale)
+            ramp = self.switch(x + 4400, y - 1600, valid, 0.0,
+                               self.ramp(x + 4200, y - 1600, d, radius, 1.0, 0.0), kind="FLOAT")
+            return self.store(x + 4600, y - 1200, g, "cb_tmp_mask",
+                              self.math(x + 4600, y - 1400, "MAXIMUM", self.named(x + 4400, y - 1400, "cb_tmp_mask"), ramp))
+
+        masked = self.repeat(x + 3500, y - 1200, self.store(x + 3400, y - 1200, sub, "cb_tmp_mask", 0.0),
+                             groups, mask_body)
+        displaced = self.detail(x + 5200, y - 1200, masked, self.named(x + 5000, y - 1600, "cb_tmp_mask"), detail)
+        has_detail = self.math(x + 5000, y - 1000, "GREATER_THAN",
+                               self.math(x + 4800, y - 1000, "ABSOLUTE", detail[3]), 0.0)
+        displaced = self.switch(x + 6400, y, has_detail, sub, displaced)
+
+        def conform_body(g, k):
+            valid, d, closest, radius, conform, offset, sink = self.group_query(x + 6600, y - 800, heroes, k, scale)
+            w = self.switch(x + 7400, y - 800, valid, 0.0,
+                            self.ramp(x + 7200, y - 800, d, radius, conform, 0.0), kind="FLOAT")
+            eps = self.math(x + 7000, y - 1200, "MULTIPLY", radius, 1e-3)
+            outward = self.vmath(x + 6800, y - 1400, "DOT_PRODUCT",
+                                 self.vmath(x + 6600, y - 1400, "SUBTRACT", self.pos, closest), sink)
+            d_out = self.switch(x + 6900, y - 1300, self.math(x + 6800, y - 1500, "LESS_THAN", outward, 0.0),
+                                d, 0.0, kind="FLOAT")
+            share = self.node("ShaderNodeMapRange", x + 7200, y - 1500, interpolation_type="SMOOTHSTEP", clamp=True)
+            self.link(d, share.inputs[0])
+            self.link(radius, share.inputs[1])
+            self.link(self.math(x + 7000, y - 1600, "MULTIPLY", radius, 3.0), share.inputs[2])
+            share.inputs[3].default_value = 1.0
+            share.inputs[4].default_value = 0.0
+            psi = self.math(x + 7400, y - 1100, "DIVIDE", share.outputs[0], self.math(
+                x + 7200, y - 1100, "ADD", self.math(x + 7000, y - 1100, "MULTIPLY", d_out, d_out),
+                self.math(x + 7000, y - 1300, "MULTIPLY", eps, eps)))
+            phi = self.switch(x + 7600, y - 1100, valid, 0.0, psi, kind="FLOAT")
+            g = self.store(x + 7600, y, g, "cb_tmp_w",
+                           self.math(x + 7600, y - 200, "ADD", self.named(x + 7400, y - 200, "cb_tmp_w"), phi))
+            pull = self.vmath(x + 7600, y - 400, "SCALE", self.goal_offset(x + 7000, y - 1000, closest, sink, offset),
+                              scale=self.math(x + 7400, y - 400, "MULTIPLY", phi, w))
+            return self.store(x + 7800, y, g, "cb_tmp_move",
+                              self.vmath(x + 7800, y - 300, "ADD", self.named(x + 7600, y - 300, "cb_tmp_move", "FLOAT_VECTOR"), pull),
+                              data_type="FLOAT_VECTOR")
+
+        start = self.store(x + 6500, y, self.store(x + 6400, y, displaced, "cb_tmp_w", 0.0),
+                           "cb_tmp_move", (0.0, 0.0, 0.0), data_type="FLOAT_VECTOR")
+        summed = self.repeat(x + 6600, y, start, groups, conform_body)
+        inv = self.math(x + 8400, y - 300, "DIVIDE", 1.0,
+                        self.math(x + 8200, y - 300, "MAXIMUM", self.named(x + 8000, y - 300, "cb_tmp_w"), 1e-30))
+        sp = self.node("GeometryNodeSetPosition", x + 8600, y)
+        self.link(summed, sp.inputs["Geometry"])
+        self.link(self.vmath(x + 8400, y - 100, "SCALE", self.named(x + 8200, y - 100, "cb_tmp_move", "FLOAT_VECTOR"),
+                             scale=inv), sp.inputs["Offset"])
+        out = self.rejoin(x + 8800, y, rest.outputs["Geometry"], sp.outputs["Geometry"])
+        clean = self.node("GeometryNodeRemoveAttribute", x + 9400, y)
+        self.link(out, clean.inputs["Geometry"])
+        clean.inputs["Pattern Mode"].default_value = "Wildcard"
+        clean.inputs["Name"].default_value = "cb_tmp_*"
+        return clean.outputs["Geometry"]
+
+    def stat_max(self, x, y, geo, field):
+        stat = self.node("GeometryNodeAttributeStatistic", x, y, data_type="FLOAT", domain="POINT")
+        self.link(geo, stat.inputs["Geometry"])
+        self.link(field, stat.inputs["Attribute"])
+        return stat.outputs["Max"]
+
+    def attribute_max(self, x, y, geo, name, data_type):
+        return self.stat_max(x, y, geo, self.named(x - 200, y, name, data_type))
 
     def switch(self, x, y, cond, false, true, kind="GEOMETRY"):
         sw = self.node("GeometryNodeSwitch", x, y, input_type=kind)
@@ -486,6 +732,10 @@ def _build_group(ng):
     _socket(ng, "Target Material", "NodeSocketMaterial")
     _socket(ng, "Ground Material", "NodeSocketMaterial")
     _socket(ng, "Shared Ground", "NodeSocketBool", default_value=False)
+    # Which overlap group the shared ground files this object under; see assign_groups().
+    _socket(ng, "Ground Group", "NodeSocketInt", default_value=0, min_value=0)
+    # 0 so a group rebuilt under an old file conforms exactly as it did; new blends get SMOOTHING.
+    _socket(ng, "Contact Smoothing", "NodeSocketInt", default_value=0, min_value=0, max_value=64)
 
     t = _Tree(ng)
     link = t.link
@@ -517,10 +767,12 @@ def _build_group(ng):
     link(g["Geometry"], sinks.inputs["Geometry"])
     link(t.true_nor, sinks.inputs["Value"])
     hero = sinks.outputs["Geometry"]
+    # the surface the ground conforms to (see _Tree.smoothed); the object's own output is `hero`
+    shape = t.smoothed(-200, -800, hero, g["Contact Smoothing"])
     stored_normal = t.node("GeometryNodeInputNamedAttribute", -300, -900, data_type="FLOAT_VECTOR")
     stored_normal.inputs["Name"].default_value = NORMAL_ATTR
-    d_tgt, p_tgt = t.proximity(0, -560, hero)
-    sink_dir = t.sample(0, -760, hero, t.nor)
+    d_tgt, p_tgt = t.proximity(0, -560, shape)
+    sink_dir = t.sample(0, -760, shape, t.nor)
     detail = (g["Detail Image"], g["Detail UV Map"], g["Detail Midlevel"], detail_dist)
 
     def conform(y, ground, sink):
@@ -538,7 +790,7 @@ def _build_group(ng):
     patch = t.island(-300, -2600, raw, d_tgt, reach)
     # It sinks along the stored normal, as the proxy does, so the two land on the same surface.
     shared_ground = conform(-2900, patch.outputs["Selection"],
-                            t.sample(0, -2900, hero, stored_normal.outputs["Attribute"]))
+                            t.sample(0, -2900, shape, stored_normal.outputs["Attribute"]))
     conformed = t.switch(3000, -1600, g["Shared Ground"], full, shared_ground)
 
     # What the hero's shading reads the ground from. With Displace Ground on, the conformed
@@ -574,7 +826,11 @@ def _build_group(ng):
     carry.inputs["Name"].default_value = PARAMS_ATTR
     link(store.outputs["Geometry"], carry.inputs["Geometry"])
     link(params.outputs[0], carry.inputs["Value"])
-    src = carry.outputs["Geometry"]
+    group = t.node("GeometryNodeStoreNamedAttribute", 3400, 0, data_type="INT", domain="POINT")
+    group.inputs["Name"].default_value = GROUP_ATTR
+    link(carry.outputs["Geometry"], group.inputs["Geometry"])
+    link(g["Ground Group"], group.inputs["Value"])
+    src = group.outputs["Geometry"]
 
     # Sample UVs from the conformed ground, whose original corner UVs have survived
     # subdivision and displacement. Sampling before the conform makes the two sides slide
@@ -584,7 +840,41 @@ def _build_group(ng):
     mapped_src = t.node("GeometryNodeStoreNamedAttribute", 3200, -1700, data_type="FLOAT2", domain="CORNER")
     mapped_src.inputs["Name"].default_value = TARGET_UV_ATTR
     link(src, mapped_src.inputs["Geometry"])
-    link(t.sample(3100, -1900, shade_ref, target_uv.outputs["Attribute"]), mapped_src.inputs["Value"])
+    # Above the ground, nearest-point sampling alone smears the texture: every point up a steep
+    # flank finds the same rim of ground below it, so the ground's texture is stretched into
+    # vertical streaks wherever the material blend reaches up the object. Continue the ground's
+    # UVs across the flank instead, as if it were folded down flat: offset the lookup by the
+    # height h above the ground (along the ground normal n) times the horizontal part m of the
+    # object's own normal, and turn that into UVs through the raw target's own mapping,
+    #     uv = uv(q) + uv_raw(q + h m) - uv_raw(q).
+    # On a vertical wall |m| = 1, so the texture keeps its real-world scale; on faces lying
+    # flat m = 0 and nothing changes; at h = 0 this is exactly the nearest-point UV, so the
+    # junction stays continuous; buried points (h < 0) are left alone. Exact for planar ground
+    # UVs, which the difference of two raw lookups measures rather than assumes.
+    # The height and "up" come from v = p - q itself -- |v|, and v / |v| -- with the ground's
+    # normal used only to tell above from buried: two nearest-surface searches can settle on
+    # different faces at a crease of the conformed ground, and mixing one's point with the
+    # other's normal would put a seam in the UVs along every crease.
+    uv_attr = target_uv.outputs["Attribute"]
+    nearest = t.proximity(2600, -2000, shade_ref)[1]
+    ground_n = t.sample(2600, -2100, shade_ref, t.true_nor)
+    rise = t.vmath(2700, -2000, "SUBTRACT", t.pos, nearest)
+    above = t.math(2800, -2100, "GREATER_THAN", t.vmath(2800, -2150, "DOT_PRODUCT", rise, ground_n), 0.0)
+    height = t.math(2800, -2000, "MULTIPLY", t.vmath(2700, -2050, "LENGTH", rise), above)
+    up = t.vmath(2600, -2250, "NORMALIZE", rise)
+    across = t.vmath(2800, -2200, "SUBTRACT", t.nor,
+                     t.vmath(2700, -2200, "SCALE", up, scale=t.vmath(2600, -2300, "DOT_PRODUCT", t.nor, up)))
+    unfolded = t.vmath(2900, -2200, "ADD", nearest, t.vmath(2900, -2300, "SCALE", across, scale=height))
+
+    def raw_uv(x, y, where):
+        s_ = t.node("GeometryNodeSampleNearestSurface", x, y, data_type="FLOAT_VECTOR")
+        link(raw, s_.inputs["Mesh"])
+        link(uv_attr, s_.inputs["Value"])
+        link(where, s_.inputs["Sample Position"])
+        return s_.outputs["Value"]
+
+    shift = t.vmath(3000, -2200, "SUBTRACT", raw_uv(3000, -2300, unfolded), raw_uv(3000, -2400, nearest))
+    link(t.vmath(3100, -2000, "ADD", t.sample(3100, -1900, shade_ref, uv_attr), shift), mapped_src.inputs["Value"])
     uv_src = t.switch(3300, -1600, g["Match Target Textures"], src, mapped_src.outputs["Geometry"])
 
     # --- weld the shading: near the target, adopt the target's normal ---
@@ -646,6 +936,7 @@ def _build_ground_group(ng):
     _socket(ng, "Detail Image", "NodeSocketImage")
     _socket(ng, "Detail UV Map", "NodeSocketString", default_value="UVMap")
     _socket(ng, "Detail Midlevel", "NodeSocketFloat", default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")
+    _socket(ng, "Contact Smoothing", "NodeSocketInt", default_value=SMOOTHING, min_value=0, max_value=64)
     _socket(ng, "Target Material", "NodeSocketMaterial")
     _socket(ng, "Ground Material", "NodeSocketMaterial")
 
@@ -660,47 +951,18 @@ def _build_ground_group(ng):
     link(g["Objects"], coll.inputs["Collection"])
     heroes = t.node("GeometryNodeRealizeInstances", -1100, 300)
     link(coll.outputs[0], heroes.inputs["Geometry"])
-    heroes = heroes.outputs["Geometry"]
+    # the same smoothed surface each object's own patch conforms to (see _Tree.smoothed)
+    heroes = t.smoothed(-900, 300, heroes.outputs["Geometry"], g["Contact Smoothing"])
 
-    # Per-vertex settings: those of the nearest object, read off its surface (each object
-    # stores them uniformly on its points, so the interpolation is exact). Where the nearest
-    # object changes from one with a large radius to one with a small radius, the weight jumps;
-    # that discontinuity is inherent to conforming one surface to several objects with
-    # different settings, and it lies where the two influences meet, not at the cut.
-    param = t.node("GeometryNodeInputNamedAttribute", -1100, 500, data_type="FLOAT_VECTOR")
-    param.inputs["Name"].default_value = PARAMS_ATTR
-    sampled = t.node("ShaderNodeSeparateXYZ", -700, 500)
-    link(t.sample(-900, 500, heroes, param.outputs["Attribute"]), sampled.inputs[0])
-    radius = t.math(-500, 600, "DIVIDE", sampled.outputs[0], scale)
-    offset = t.math(-500, 500, "DIVIDE", sampled.outputs[2], scale)
-    # The island needs one bound that is >= the radius at every point (see _Tree.conform), and
-    # the sampled radius is not that: a face centre can sit nearest a pebble while one of its
-    # corners sits nearest a boulder. The largest radius of any object is.
-    own = t.node("ShaderNodeSeparateXYZ", -900, 800)
-    link(param.outputs["Attribute"], own.inputs[0])
-    stat = t.node("GeometryNodeAttributeStatistic", -700, 800, data_type="FLOAT", domain="POINT")
-    link(heroes, stat.inputs["Geometry"])
-    link(own.outputs[0], stat.inputs["Attribute"])
-    island_radius = t.math(-500, 800, "DIVIDE", stat.outputs["Max"], scale)
-
-    # Sink along the normal each object stored for this (see _build_group): their output carries
-    # the welded custom normals, which near the contact point along the ground, not out of it.
-    stored = t.node("GeometryNodeInputNamedAttribute", -1100, 900, data_type="FLOAT_VECTOR")
-    stored.inputs["Name"].default_value = NORMAL_ATTR
-    sink_dir = t.sample(-900, 900, heroes, stored.outputs["Attribute"])
-
-    dist, closest = t.proximity(-900, 100, heroes)
     detail = (g["Detail Image"], g["Detail UV Map"], g["Detail Midlevel"],
               t.math(-500, 400, "DIVIDE", g["Ground Detail"], scale))
-    conformed = t.conform(0, 0, raw, dist, closest, radius, island_radius, sampled.outputs[1],
-                          offset, sink_dir, g["Contact Subdivisions"], detail)
+    conformed = t.conform_groups(0, 0, raw, heroes, scale, g["Contact Subdivisions"], detail)
     # With no objects, or none that may move the ground (all have Displace Ground off or Ground
     # Conform 0, which they write as weight 0), there is nothing to do: pass the target through
     # untouched without evaluating any of the conform. The statistic of an empty geometry is 0.
-    weight = t.node("GeometryNodeAttributeStatistic", -700, 1100, data_type="FLOAT", domain="POINT")
-    link(heroes, weight.inputs["Geometry"])
-    link(own.outputs[1], weight.inputs["Attribute"])
-    active = t.math(-500, 1100, "GREATER_THAN", weight.outputs["Max"], 0.0)
+    weights = t.node("ShaderNodeSeparateXYZ", -900, 1100)
+    link(t.named(-1100, 1100, PARAMS_ATTR, "FLOAT_VECTOR"), weights.inputs[0])
+    active = t.math(-500, 1100, "GREATER_THAN", t.stat_max(-700, 1100, heroes, weights.outputs[1]), 0.0)
     ground = t.switch(3000, 0, active, raw, conformed)
     out = t.set_ground_material(3200, 0, ground, g["Target Material"], g["Ground Material"])
     link(out, gout.inputs[0])
@@ -782,29 +1044,6 @@ def _copy_curve_mapping(src, dst):
     dst.update()
 
 
-def _absolute_location(node):
-    if hasattr(node, "location_absolute"):
-        return tuple(node.location_absolute)
-    x, y = node.location
-    parent = node.parent
-    while parent is not None:
-        x, y = x + parent.location[0], y + parent.location[1]
-        parent = parent.parent
-    return x, y
-
-
-def _set_absolute_location(node, xy):
-    if hasattr(node, "location_absolute"):
-        node.location_absolute = xy
-        return
-    px = py = 0.0
-    parent = node.parent
-    while parent is not None:
-        px, py = px + parent.location[0], py + parent.location[1]
-        parent = parent.parent
-    node.location = (xy[0] - px, xy[1] - py)
-
-
 def _copy_nodes(src_tree, dst_tree, offset):
     """Clone every non-output node of `src_tree` into `dst_tree`. Returns {old: new}."""
     m = {}
@@ -831,8 +1070,8 @@ def _copy_nodes(src_tree, dst_tree, offset):
         if n.parent in m:
             c.parent = m[n.parent]
     for n, c in m.items():
-        x, y = _absolute_location(n)
-        _set_absolute_location(c, (x + offset[0], y + offset[1]))
+        x, y = n.location_absolute
+        c.location_absolute = (x + offset[0], y + offset[1])
     for l in src_tree.links:
         f, t = m.get(l.from_node), m.get(l.to_node)
         if not f or not t:
@@ -967,12 +1206,11 @@ def _texture_settings(src, tgt):
     uv_name = _target_uv_name(tgt)
     if not mod:
         return True, uv_name, None
-    ids = input_ids(mod.node_group)
-    if not mod.get("cb_uv_initialized") or mod.get("cb_uv_target") != tgt:
-        mod[ids["Target UV Map"]] = uv_name
-        mod["cb_uv_initialized"] = True
-        mod["cb_uv_target"] = tgt
-    return bool(mod[ids["Match Target Textures"]]), mod[ids["Target UV Map"]], mod
+    if not meta(mod, "cb_uv_initialized") or meta(mod, "cb_uv_target") != tgt:
+        set_socket(mod, "Target UV Map", uv_name)
+        set_meta(mod, "cb_uv_initialized", True)
+        set_meta(mod, "cb_uv_target", tgt)
+    return bool(socket(mod, "Match Target Textures", True)), socket(mod, "Target UV Map", ""), mod
 
 
 def _material_mix(mat):
@@ -1164,9 +1402,8 @@ def setup_material(src, tgt, refresh=False):
         changed |= _blend_material(smat, tmat, tgt, match_textures, uv_name, groups, refresh)
     # A shared blend draws no ground of its own; the proxy carries the corrected ground material.
     if mod and changed and not is_shared(mod):
-        ids = input_ids(mod.node_group)
-        mod[ids["Target Material"]] = tmat
-        mod[ids["Ground Material"]] = _corrected_ground(tmat, tgt, uv_name) if match_textures else tmat
+        set_socket(mod, "Target Material", tmat)
+        set_socket(mod, "Ground Material", _corrected_ground(tmat, tgt, uv_name) if match_textures else tmat)
     _cleanup_texture_data()
     return None
 
@@ -1289,6 +1526,18 @@ def find_mod(obj):
     return obj and next((m for m in obj.modifiers if _is_blend_mod(m)), None)
 
 
+def _inputs(mod):
+    """The modifier's input values as RNA on 5.2 and later, or None on 5.0/5.1.
+
+    Up to 5.1 a Geometry Nodes modifier keeps its input values as ID properties named after the
+    socket identifiers (`mod["Socket_3"]`). From 5.2 the modifier takes no ID properties at all
+    and the values live at `mod.properties.inputs.Socket_3.value`. Everything here goes through
+    socket()/set_socket()/socket_prop() so both work.
+    """
+    props = getattr(mod, "properties", None)
+    return getattr(props, "inputs", None)
+
+
 def socket(mod, name, default=None):
     """Value of the modifier input called `name`, or `default` if its group has none.
 
@@ -1300,21 +1549,67 @@ def socket(mod, name, default=None):
     ident = input_ids(mod.node_group).get(name)
     if ident is None:
         return default
-    value = mod.get(ident)
+    inputs = _inputs(mod)
+    if inputs is not None:
+        item = getattr(inputs, ident, None)
+        value = item.value if item is not None else None
+    else:
+        value = mod.get(ident)
     return default if value is None else value
 
 
 def set_socket(mod, name, value):
     ident = input_ids(mod.node_group).get(name)
-    if ident is not None:
+    if ident is None:
+        return False
+    inputs = _inputs(mod)
+    if inputs is None:
         mod[ident] = value
-    return ident is not None
+        return True
+    item = getattr(inputs, ident, None)
+    if item is None:
+        return False
+    item.value = value
+    return True
 
 
-def socket_key(mod, name):
-    """RNA path of input `name` on `mod`, for layout.prop(), or None."""
+def socket_prop(mod, name):
+    """(data, property) to hand layout.prop() for input `name` on `mod`, or None."""
     ident = input_ids(mod.node_group).get(name) if mod and mod.node_group else None
-    return f'["{ident}"]' if ident else None
+    if ident is None:
+        return None
+    inputs = _inputs(mod)
+    if inputs is None:
+        return mod, f'["{ident}"]'
+    item = getattr(inputs, ident, None)
+    return (item, "value") if item is not None else None
+
+
+def meta(mod, key, default=None):
+    """Bookkeeping the add-on keeps for a blend, stored on its object.
+
+    It used to be stored on the modifier, which from 5.2 takes no custom properties; files
+    saved that way under 5.0/5.1 are still read.
+    """
+    value = mod.id_data.get(key)
+    if value is None:
+        try:
+            value = mod.get(key)
+        except TypeError:
+            value = None
+    return default if value is None else value
+
+
+def set_meta(mod, key, value):
+    mod.id_data[key] = value
+
+
+def del_meta(mod, key):
+    mod.id_data.pop(key, None)
+    try:
+        mod.pop(key, None)
+    except TypeError:
+        pass
 
 
 def mod_target(mod):
@@ -1401,14 +1696,14 @@ def _restore_target(tgt):
 
 def _sync_target_visibility(mod, ctx):
     tgt = mod_target(mod)
-    old = mod.get(HIDDEN_TARGET_KEY)
+    old = meta(mod, HIDDEN_TARGET_KEY)
     ground_on = displaces(mod)
     if old and (old != tgt or not ground_on):
-        del mod[HIDDEN_TARGET_KEY]
+        del_meta(mod, HIDDEN_TARGET_KEY)
         _restore_target(old)
     if tgt and ground_on:
         _hide_target(tgt, ctx)
-        mod[HIDDEN_TARGET_KEY] = tgt
+        set_meta(mod, HIDDEN_TARGET_KEY, tgt)
 
 
 def target_leaks(mod):
@@ -1478,12 +1773,11 @@ def fit_to_object(mod, obj):
     width = object_width(obj)
     if not width:
         return False
-    ids = input_ids(mod.node_group)
     contact = min(max(width / 3, 0.001), 50.0)
-    mod[ids["Contact Distance"]] = contact
-    mod[ids["Material Blend Distance"]] = contact
-    mod[ids["Normal Blend Distance"]] = contact * 2 / 3
-    mod[ids["Surface Offset"]] = min(max(contact * 0.012, 1e-5), 0.05)
+    set_socket(mod, "Contact Distance", contact)
+    set_socket(mod, "Material Blend Distance", contact)
+    set_socket(mod, "Normal Blend Distance", contact * 2 / 3)
+    set_socket(mod, "Surface Offset", min(max(contact * 0.012, 1e-5), 0.05))
     obj.update_tag()
     return True
 
@@ -1497,8 +1791,8 @@ def fit_to_object(mod, obj):
 # modifier conforms the target to every object in a helper collection at once. The objects keep
 # reading the raw target; only the proxy reads them.
 
-GROUND_SETTINGS = ("Contact Subdivisions", "Ground Detail", "Detail Image", "Detail UV Map",
-                   "Detail Midlevel")
+GROUND_SETTINGS = ("Contact Subdivisions", "Contact Smoothing", "Ground Detail", "Detail Image",
+                   "Detail UV Map", "Detail Midlevel")
 
 
 def ground_mod(obj):
@@ -1586,8 +1880,7 @@ def _propagate(proxy_mod, heroes):
 
 
 def _raw(mod, name):
-    ident = input_ids(mod.node_group).get(name)
-    return mod.get(ident) if ident else None
+    return socket(mod, name)
 
 
 def _ensure_proxy(tgt, coll, seed):
@@ -1651,6 +1944,9 @@ def sync_ground(tgt, refresh=False, seed=None):
     _sync_membership(coll, heroes)
     proxy, mod = _ensure_proxy(tgt, coll, seed or find_mod(heroes[0]))
     _propagate(mod, heroes)
+    proxy[REACH_KEY] = ground_reach(tgt)
+    coll[PROXY_KEY] = proxy
+    assign_groups(tgt, heroes, proxy[REACH_KEY])
     # One corrected ground material per target, however many objects stand on it.
     tmat = tgt.active_material
     if refresh or socket(mod, "Target Material") != tmat or socket(mod, "Ground Material") is None:
@@ -1679,36 +1975,142 @@ def sync_all(refresh=(), seeds=None):
             _remove_proxy(obj)
 
 
+def ground_reach(tgt):
+    """The largest face reach (half perimeter) on the evaluated target, in world metres.
+
+    assign_groups() needs it to keep members of one overlap group far enough apart that a
+    single face cannot span from one's band to the other's. Taken once per sync: the
+    operators refresh it, and Update after editing the ground's mesh picks up a coarser one.
+    """
+    import numpy as np
+    ev = tgt.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    me = ev.to_mesh() if tgt.type == "MESH" else None
+    try:
+        if me is None or not me.polygons:
+            return float(max(tgt.dimensions)) if tgt.dimensions else 0.0
+        co = np.empty(len(me.vertices) * 3)
+        me.vertices.foreach_get("co", co)
+        co = co.reshape(-1, 3)
+        ends = np.empty(len(me.edges) * 2, dtype=np.int64)
+        me.edges.foreach_get("vertices", ends)
+        ends = ends.reshape(-1, 2)
+        length = np.linalg.norm(co[ends[:, 0]] - co[ends[:, 1]], axis=1)
+        corner_edges = np.empty(len(me.loops), dtype=np.int64)
+        me.loops.foreach_get("edge_index", corner_edges)
+        starts = np.empty(len(me.polygons), dtype=np.int64)
+        me.polygons.foreach_get("loop_start", starts)
+        perimeter = np.add.reduceat(length[corner_edges], starts)
+        return float(perimeter.max()) / 2 * max(abs(c) for c in tgt.matrix_world.to_scale())
+    finally:
+        if me is not None:
+            ev.to_mesh_clear()
+
+
+def assign_groups(tgt, heroes, reach):
+    """Split the objects on one shared ground into overlap groups, and return how many.
+
+    The shared ground blends per group (see _Tree.conform_groups), and its continuity and
+    crack-freedom need two members i, j of one group to be farther apart than
+    6 max(R_i, R_j) + 4 r_max (R: Contact Distance, r_max: the ground's largest face reach). The
+    gap is bounded from below with world bounding spheres, so the test is conservative; a
+    spatial hash keeps it linear in the number of objects. Greedy colouring, largest first.
+    Only changed groups are written, so re-running it on an unchanged scene touches nothing.
+    """
+    from mathutils import Vector
+    spheres = []
+    for obj in heroes:
+        corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+        centre = sum(corners, Vector()) / 8
+        spheres.append((obj, centre, max((c - centre).length for c in corners),
+                        max(socket(find_mod(obj), "Contact Distance", 0.0), 0.0)))
+    if not spheres:
+        return 0
+    margin = 4 * reach + 1e-4
+    cell = max(2 * rad + 6 * contact for _, _, rad, contact in spheres) + margin
+    grid = {}
+    for item in spheres:
+        key = tuple(int(c // cell) for c in item[1])
+        grid.setdefault(key, []).append(item)
+    order = sorted(spheres, key=lambda item: -(item[2] + item[3]))
+    groups = {}
+    for obj, centre, rad, contact in order:
+        key = tuple(int(c // cell) for c in centre)
+        taken = set()
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for other, c2, rad2, contact2 in grid.get((key[0] + dx, key[1] + dy, key[2] + dz), ()):
+                        if other is obj or other.as_pointer() not in groups:
+                            continue
+                        gap = (centre - c2).length - rad - rad2
+                        if gap <= 6 * max(contact, contact2) + margin:
+                            taken.add(groups[other.as_pointer()])
+        group = next(i for i in range(len(spheres) + 1) if i not in taken)
+        groups[obj.as_pointer()] = group
+        mod = find_mod(obj)
+        if socket(mod, "Ground Group") != group:
+            set_socket(mod, "Ground Group", group)
+            obj.update_tag()
+    return max(groups.values()) + 1
+
+
 _reconciling = False
 
 
 @bpy.app.handlers.persistent
 def _on_depsgraph(scene, depsgraph=None):
-    """Keep membership and ground settings current between operator runs.
+    """Keep shared grounds current between operator runs, at the cost of what changed.
 
     Duplicating an object (Shift+D) only links the copy into collections that are in the
     scene, so the helper collection -- in no scene by design -- does not get it, although the
-    copy's modifier targets the same ground. Editing a ground setting on the proxy has to reach
-    the objects' local patches too. Both are cheap, idempotent comparisons; only differences
-    are written, so the update this triggers comes back here with nothing to do. Creating or
-    deleting the proxy is left to operators.
+    copy's modifier targets the same ground. Moving an object can bring it close enough to a
+    neighbour that their overlap groups must differ. Editing a ground setting on the proxy has
+    to reach the objects' local patches. All of it is driven by depsgraph.updates -- only the
+    objects that actually changed -- so with thousands of unrelated objects in the scene this
+    costs nothing measurable. Only differences are written, so the update that triggers comes
+    back here with nothing to do. Creating or deleting the proxy is left to operators.
     """
     global _reconciling
-    if _reconciling:
-        return
-    colls = [c for c in bpy.data.collections if c.get(HEROES_KEY) is not None]
-    if not colls:
+    if _reconciling or depsgraph is None or not depsgraph.id_type_updated("OBJECT"):
         return
     _reconciling = True
     try:
-        for coll in colls:
-            tgt = coll[HEROES_KEY]
-            heroes = shared_heroes(tgt)
-            if heroes:
-                _sync_membership(coll, heroes)
-            proxy = find_proxy(tgt)
-            if proxy is not None:
-                _propagate(ground_mod(proxy), heroes)
+        regroup, settings = {}, {}
+        for update in depsgraph.updates:
+            obj = getattr(update.id, "original", None)
+            if not isinstance(obj, bpy.types.Object):
+                continue
+            if obj.get(PROXY_KEY):
+                tgt = proxy_target(obj)
+                if tgt is not None:
+                    settings[tgt.as_pointer()] = (tgt, obj)
+                continue
+            if obj.type != "MESH":
+                continue
+            mod = find_mod(obj)
+            wanted = mod_target(mod) if mod is not None and is_shared(mod) and displaces(mod) else None
+            for coll in obj.users_collection:
+                owner = coll.get(HEROES_KEY)
+                if owner is not None and owner != wanted:
+                    coll.objects.unlink(obj)
+                    regroup[owner.as_pointer()] = owner
+            if wanted is not None:
+                coll = heroes_collection(wanted)
+                if coll is not None:
+                    if coll.objects.get(obj.name) != obj:
+                        coll.objects.link(obj)
+                    regroup[wanted.as_pointer()] = wanted
+        for tgt, proxy in settings.values():
+            coll = heroes_collection(tgt)
+            if coll is not None:
+                _propagate(ground_mod(proxy), list(coll.objects))
+        for tgt in regroup.values():
+            coll = heroes_collection(tgt)
+            if coll is None:
+                continue
+            proxy = coll.get(PROXY_KEY)            # recorded by sync_ground(); no scene scan
+            reach = proxy.get(REACH_KEY, 0.0) if proxy is not None else 0.0
+            assign_groups(tgt, list(coll.objects), reach)
     except (AttributeError, RuntimeError, ReferenceError):
         pass     # restricted context (rendering, file I/O): the next update catches up
     finally:
@@ -1727,13 +2129,13 @@ def _record_applied(mod):
            "uv": str(socket(mod, "Target UV Map", "")), "shared": is_shared(mod)}
     if mod_target(mod) is not None:
         rec["target"] = mod_target(mod)
-    mod[APPLIED_KEY] = rec
+    set_meta(mod, APPLIED_KEY, rec)
 
 
 def out_of_sync(obj, mod):
     """Reasons the blend on `obj` no longer matches what was applied; empty when current."""
     reasons = []
-    rec = mod.get(APPLIED_KEY)
+    rec = meta(mod, APPLIED_KEY)
     if rec is not None:
         if rec.get("target") != mod_target(mod):
             reasons.append("Target changed")
@@ -1769,8 +2171,11 @@ def _set_displace(self, value):
         return
     _sync_target_visibility(mod, bpy.context)
     sync_all()
-    if APPLIED_KEY in mod:
-        mod[APPLIED_KEY]["displace"] = bool(value)
+    rec = meta(mod, APPLIED_KEY)
+    if rec is not None:
+        rec = dict(rec)
+        rec["displace"] = bool(value)
+        set_meta(mod, APPLIED_KEY, rec)
     self.update_tag()
 
 
@@ -2115,6 +2520,7 @@ class CONTACTBLEND_OT_add(bpy.types.Operator):
                 mod = hero.modifiers.new(GROUP, "NODES")
                 mod.node_group = build_group()
                 fit_to_object(mod, hero)
+                set_socket(mod, "Contact Smoothing", SMOOTHING)
                 share(mod)
                 created.append(hero)
             set_socket(mod, "Target", tgt)
@@ -2271,7 +2677,9 @@ class CONTACTBLEND_OT_remove(bpy.types.Operator):
             return {"CANCELLED"}
         for src in objs:
             mod = find_mod(src)
-            targets = [mod_target(mod), mod.get(HIDDEN_TARGET_KEY)]
+            targets = [mod_target(mod), meta(mod, HIDDEN_TARGET_KEY)]
+            for key in (HIDDEN_TARGET_KEY, APPLIED_KEY, "cb_uv_initialized", "cb_uv_target"):
+                del_meta(mod, key)
             src.modifiers.remove(mod)
             # Older files may contain duplicate modifiers. Keep the material blend until
             # the last modifier is removed, rather than breaking a remaining blend.
@@ -2445,15 +2853,15 @@ class CONTACTBLEND_OT_diagnose(bpy.types.Operator):
 
 def _row_prop(layout, mod, name, text=None, search=None):
     """One modifier-input row, with a datablock/UV picker where one applies. Never raises."""
-    key = socket_key(mod, name)
-    if key is None:
+    target = socket_prop(mod, name)
+    if target is None:
         return None
     text = name if text is None else text
     if search is not None and search[0] is not None:
-        layout.prop_search(mod, key, search[0], search[1], text=text)
+        layout.prop_search(*target, search[0], search[1], text=text)
     else:
-        layout.prop(mod, key, text=text)
-    return key
+        layout.prop(*target, text=text)
+    return target
 
 
 def _uv_search(tgt):
@@ -2566,6 +2974,7 @@ def _draw_hero(ctx, layout, obj, mod):
 
 def _draw_ground_settings(layout, mod, tgt):
     _row_prop(layout, mod, "Contact Subdivisions", text="Subdivisions")
+    _row_prop(layout, mod, "Contact Smoothing", text="Smoothing")
     _row_prop(layout, mod, "Ground Detail", text="Detail Height")
     _row_prop(layout, mod, "Detail Image", search=(bpy.data, "images"))
     _row_prop(layout, mod, "Detail UV Map", search=_uv_search(tgt))
@@ -2747,7 +3156,7 @@ def _selftest():
     assert bpy.ops.object.contact_blend() == {"FINISHED"}
     mod = rock.modifiers[-1]
     ids = input_ids(mod.node_group)
-    mod[ids["Surface Offset"]] = 0.01
+    set_socket(mod, "Surface Offset", 0.01)
 
     def ev_mesh(obj=rock):
         obj.update_tag()
@@ -2801,13 +3210,13 @@ def _selftest():
         return {i for e, c in seen.items() if c == 1 for i in e
                 if abs(me.vertices[i].co.x) < rim and abs(me.vertices[i].co.y) < rim}
 
-    gmod[gids["Contact Subdivisions"]] = 0
+    set_socket(gmod, "Contact Subdivisions", 0)
     assert len(ev_mesh().vertices) == len(base), "the hero carries more than its own mesh"
     me = ev_mesh(proxy)
     assert len(me.vertices) == len(gbase), (len(me.vertices), len(gbase))
     coarse = len(ground_co(me))
 
-    gmod[gids["Contact Subdivisions"]] = 2
+    set_socket(gmod, "Contact Subdivisions", 2)
     me = ev_mesh(proxy)
     gco = ground_co(me)
     assert len(gco) > coarse * 1.5, f"contact zone not subdivided ({coarse} -> {len(gco)})"
@@ -2860,10 +3269,10 @@ def _selftest():
     assert target_leaks(mod) is ground, "eye-hidden but render-visible went undetected"
     assert bpy.ops.object.contact_blend_hide_target() == {"FINISHED"}
     assert ground.hide_render and target_leaks(mod) is None, "fix button did not fix it"
-    mod[ids["Displace Ground"]] = False              # no copy joined, target must stay visible
+    set_socket(mod, "Displace Ground", False)              # no copy joined, target must stay visible
     ground.hide_render = False
     assert target_leaks(mod) is None, "warned about a visible target with no ground copy"
-    mod[ids["Displace Ground"]] = True
+    set_socket(mod, "Displace Ground", True)
 
     # material displacement moves the target after the modifier stack, where nothing in this
     # node group can see it -- the blend is computed against a surface that is no longer there
@@ -2882,7 +3291,7 @@ def _selftest():
     # rather than quietly running the tree the .blend was first built with
     ng = mod.node_group
     assert group_version(ng) == GROUP_VERSION, group_version(ng)
-    mod[ids["Contact Distance"]] = 0.1234
+    set_socket(mod, "Contact Distance", 0.1234)
     ng[VERSION_KEY] = 0                              # pretend the file predates this build
     n_nodes = len(ng.nodes)
     ng2 = build_group()
@@ -2890,10 +3299,10 @@ def _selftest():
     assert group_version(ng) == GROUP_VERSION, "version stamp not updated"
     assert len(ng.nodes) == n_nodes, (len(ng.nodes), n_nodes)
     ids = input_ids(ng)
-    assert abs(mod[ids["Contact Distance"]] - 0.1234) < 1e-6, "settings lost across rebuild"
-    assert mod[ids["Target"]] == ground, "target lost across rebuild"
+    assert abs(socket(mod, "Contact Distance") - 0.1234) < 1e-6, "settings lost across rebuild"
+    assert socket(mod, "Target") == ground, "target lost across rebuild"
     assert build_group() is ng and len(ng.nodes) == n_nodes, "rebuilt again when up to date"
-    mod[ids["Contact Distance"]] = 0.3
+    set_socket(mod, "Contact Distance", 0.3)
 
     # --- a .blend saved under the pre-1.1 name must migrate, not orphan ---
     # Put the file back the way an old release left it: group and mix node under the old name,
@@ -2930,8 +3339,8 @@ def _selftest():
     img = bpy.data.images.new("height", 8, 8)
     img.pixels = [1.0] * (8 * 8 * 4)
     flat = [v.co.copy() for v in ev_mesh(proxy).vertices]
-    gmod[gids["Detail Image"]] = img
-    gmod[gids["Ground Detail"]] = 0.25
+    set_socket(gmod, "Detail Image", img)
+    set_socket(gmod, "Ground Detail", 0.25)
     me = ev_mesh(proxy)
     assert len(me.vertices) == len(flat), "detail changed the topology"
     moved_by = [(v.co - b).length for v, b in zip(me.vertices, flat)]
@@ -2947,7 +3356,7 @@ def _selftest():
     assert max(abs(me.vertices[i].co.z - floor) for i in tj2) < 1e-6, \
         "contact-zone detail tore the subdivision cut"
     detail_max = max(moved_by)
-    gmod[gids["Ground Detail"]] = 0.0
+    set_socket(gmod, "Ground Detail", 0.0)
 
     unregister()
     print(f"OK  hero_moved={moved:.6f}  ground dip={dip:.4f} far={far:.6f} "

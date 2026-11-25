@@ -42,7 +42,7 @@ class TextureTests(unittest.TestCase):
         self.assertEqual(bpy.ops.object.contact_blend(), {"FINISHED"})
         mod = cb.find_mod(self.source)
         ids = cb.input_ids(mod.node_group)
-        mod[ids["Displace Ground"]] = ground
+        cb.set_socket(mod, "Displace Ground", ground)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         return mod, ids
 
@@ -95,18 +95,29 @@ class TextureTests(unittest.TestCase):
         # a vertex sitting on the surface "belongs" to is then a coin toss decided by rounding.
         bpy.ops.mesh.primitive_cube_add(size=1, location=(0.03, 0.02, 0.4))
         self.source = bpy.context.object
+        # vertices along the sides, so there are visible corners within every blend distance
+        bpy.ops.object.modifier_add(type="SUBSURF")
+        self.source.modifiers[0].subdivision_type = "SIMPLE"
+        self.source.modifiers[0].levels = 3
+        bpy.ops.object.modifier_apply(modifier=self.source.modifiers[0].name)
         self.source.data.materials.append(bpy.data.materials["Hero"])
         mod, ids = self.apply(ground=True)
+        # The expectation below uses each ground triangle's flat normal, which is exact where the
+        # conformed ground is flat around the cube's faces: conform to the cube itself, unsmoothed.
+        cb.set_socket(cb.ground_mod(cb.find_proxy(self.target)), "Contact Smoothing", 0)
+        cb.set_socket(mod, "Contact Smoothing", 0)
+        self.source.update_tag()
+        cb.find_proxy(self.target).update_tag()   # socket writes from Python do not tag; the UI would
         # Shared: the object samples a locally conformed patch, which has to match the ground
         # the proxy draws wherever the target shader can show (inside every blend distance).
-        reach = max(mod[ids["Contact Distance"]], mod[ids["Material Blend Distance"]],
-                    mod[ids["Normal Blend Distance"]])
+        reach = max(cb.socket(mod, "Contact Distance"), cb.socket(mod, "Material Blend Distance"),
+                    cb.socket(mod, "Normal Blend Distance"))
         proxy = cb.find_proxy(self.target)
         self.assertIsNotNone(proxy)
         self.assertGreater(self.check_sampled_uvs(proxy, None, reach), 0)
         # Joined: the object samples its own joined copy, everywhere.
         self.joined()
-        self.assertGreater(self.check_sampled_uvs(self.source, mod[ids["Ground Material"]], None), 0)
+        self.assertGreater(self.check_sampled_uvs(self.source, cb.socket(mod, "Ground Material"), None), 0)
 
     def check_sampled_uvs(self, ground_obj, ground_material, reach):
         """Compare the object's projected UVs with the UVs on the ground it sits on. Returns
@@ -134,22 +145,77 @@ class TextureTests(unittest.TestCase):
                     _, _, _, dist = bvh.find_nearest(point)
                     if reach is not None and dist > reach:
                         continue
+                    # Shared: only what can be seen. Under the conformed ground -- in the crater,
+                    # or just beneath the meniscus -- nearest-surface searches can settle on
+                    # different faces where several are equally near, and the object's patch and
+                    # the shared ground need not agree there; the joined copy is the very mesh
+                    # the object sampled, so it is compared everywhere.
+                    if reach is not None:
+                        near, normal, *_ = bvh.find_nearest(point)
+                        if (point - near).dot(normal) < 0:
+                            continue
                     # Where several triangles are equally near (a crease the ground folds around),
                     # which one is "the" nearest is decided by rounding; any of them is right.
                     errors = []
+                    own_normal = self.source.data.polygons[poly.index].normal
                     for near, _, near_index, _ in bvh.find_nearest_range(point, dist + 1e-6):
                         tri = triangles[near_index]
                         expected = barycentric_transform(
                             near, *(co[i] for i in tri.vertices),
                             *(Vector((*original_uvs[i].uv, 0)) for i in tri.loops))
+                        # above the ground the UVs continue across the object's flank (see
+                        # _build_group): height times the horizontal part of its own normal,
+                        # through the ground's planar mapping (4 m grid: 1/4 UV per metre)
+                        n = (co[tri.vertices[1]] - co[tri.vertices[0]]).cross(
+                            co[tri.vertices[2]] - co[tri.vertices[0]]).normalized()
+                        rise = point - near
+                        height = rise.length if rise.dot(n) > 0 else 0.0
+                        up = rise.normalized()
+                        across = own_normal - up * own_normal.dot(up)
+                        expected.xy += (across * height).xy / 4
                         errors.append((sampled_uvs[index].uv - expected.xy).length)
-                    self.assertLess(min(errors), 1e-5)
+                    # Shared: the object's patch is computed in its own frame and the shared ground
+                    # in the target's, so their float32 noise (~1e-5 m) reaches the UVs, scaled
+                    # by the unfold height above the ground; joined compares like with like.
+                    self.assertLess(min(errors), 5e-5 if reach is not None else 1e-5)
                     count += 1
             return count
         finally:
             if gmesh is not mesh:
                 ground.to_mesh_clear()
             hero.to_mesh_clear()
+
+    def test_ground_uvs_are_not_stretched_up_a_steep_flank(self):
+        # A tall box with vertical sides on a flat 4 m plane: up the side, the projected ground
+        # UVs must advance at the ground's own rate (1/4 per metre), not stay frozen at the rim.
+        bpy.data.objects.remove(self.source, do_unlink=True)
+        bpy.ops.mesh.primitive_cube_add(size=1, location=(0.2, 0.1, 0.4))
+        self.source = bpy.context.object
+        self.source.data.materials.append(bpy.data.materials["Hero"])
+        bpy.ops.object.modifier_add(type="SUBSURF")
+        self.source.modifiers[0].subdivision_type = "SIMPLE"
+        self.source.modifiers[0].levels = 3
+        bpy.ops.object.modifier_apply(modifier=self.source.modifiers[0].name)
+        mod, ids = self.apply(ground=False)
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        mesh = self.source.evaluated_get(depsgraph).to_mesh()
+        try:
+            uv = mesh.uv_layers[cb.TARGET_UV_ATTR].data
+            column = {}          # corners on the -Y wall at x = world 0.2, by height
+            for poly in mesh.polygons:
+                if poly.normal.y > -0.99:
+                    continue
+                for index in poly.loop_indices:
+                    co = self.source.matrix_world @ mesh.vertices[mesh.loops[index].vertex_index].co
+                    if abs(co.x - 0.2) < 1e-4 and co.z > 0:
+                        column[round(co.z, 4)] = uv[index].uv.copy()
+            heights = sorted(column)
+            self.assertGreater(len(heights), 3)
+            for low, high in zip(heights, heights[1:]):
+                rate = (column[high] - column[low]).length / (high - low)
+                self.assertAlmostEqual(rate, 0.25, delta=0.25 * 0.02, msg=f"stretched between {low} and {high}")
+        finally:
+            self.source.evaluated_get(depsgraph).to_mesh_clear()
 
     def test_implicit_image_uvs_and_named_uv_nodes_are_rebound(self):
         tree = self.target.active_material.node_tree
@@ -189,7 +255,7 @@ class TextureTests(unittest.TestCase):
         self.assertIsNone(coord.object)
         # joined: the object's own copy gets the same correction
         self.joined()
-        ground = mod[ids["Ground Material"]]
+        ground = cb.socket(mod, "Ground Material")
         self.assertNotEqual(ground, self.target.active_material)
         self.assertEqual(ground.node_tree.nodes[coord.name].object, self.target)
 
@@ -230,7 +296,7 @@ class TextureTests(unittest.TestCase):
     def test_texture_matching_can_be_disabled(self):
         self.target.active_material.node_tree.nodes.new("ShaderNodeTexImage")
         mod, ids = self.apply()
-        mod[ids["Match Target Textures"]] = False
+        cb.set_socket(mod, "Match Target Textures", False)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertFalse(self.copied_nodes("TEX_IMAGE")[0].inputs["Vector"].is_linked)
         for mode in ("shared", "joined"):
@@ -238,7 +304,7 @@ class TextureTests(unittest.TestCase):
                 if mode == "joined":
                     self.joined()
                     # a joined copy then keeps the target's material unchanged
-                    self.assertEqual(mod[ids["Ground Material"]], self.target.active_material)
+                    self.assertEqual(cb.socket(mod, "Ground Material"), self.target.active_material)
                 evaluated = self.source.evaluated_get(bpy.context.evaluated_depsgraph_get())
                 mesh = evaluated.to_mesh()
                 try:
@@ -253,7 +319,7 @@ class TextureTests(unittest.TestCase):
         tree.nodes.new("ShaderNodeTexImage")
         mod, ids = self.apply()
         self.assertIn("SecondaryUV", self.source.active_material["cb_texture_warnings"])
-        mod[ids["Target UV Map"]] = "MissingUV"
+        cb.set_socket(mod, "Target UV Map", "MissingUV")
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertIn("UV map is missing", self.source.active_material["cb_texture_warnings"])
 
@@ -342,9 +408,9 @@ class TextureTests(unittest.TestCase):
         mod, ids = self.apply(ground=True)
         # A wide conform under a narrow material band: the meniscus climbs higher, relative to
         # Material Blend Distance, than the band reaches from the flat original.
-        mod[ids["Contact Distance"]] = 0.6
-        mod[ids["Material Blend Distance"]] = 0.15
-        mod[ids["Normal Blend Distance"]] = 0.1
+        cb.set_socket(mod, "Contact Distance", 0.6)
+        cb.set_socket(mod, "Material Blend Distance", 0.15)
+        cb.set_socket(mod, "Normal Blend Distance", 0.1)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         proxy = cb.find_proxy(self.target)
         evaluated = proxy.evaluated_get(bpy.context.evaluated_depsgraph_get())
