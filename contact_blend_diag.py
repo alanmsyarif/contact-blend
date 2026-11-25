@@ -16,13 +16,45 @@ NAMES = (GROUP,) + LEGACY_NAMES
 VERSION_KEYS = ("cb_version", "bts_version")
 
 
-def find_mod(obj):
-    return obj and next((m for m in obj.modifiers if m.type == "NODES"
-                         and m.node_group and m.node_group.name in NAMES), None)
-
-
 def group_version(ng):
     return next((ng[k] for k in VERSION_KEYS if k in ng), None)
+
+
+def input_names(ng):
+    return {i.name for i in ng.interface.items_tree
+            if i.item_type == "SOCKET" and i.in_out == "INPUT"}
+
+
+def is_ours(ng):
+    # Mirrors the add-on: by stamp (or, pre-stamp, by socket layout), never by name -- an
+    # appended object's group arrives as "Contact Blend.001".
+    return ng.bl_idname == "GeometryNodeTree" and (
+        group_version(ng) is not None or "Contact Distance" in input_names(ng))
+
+
+def find_mod(obj):
+    return obj and next((m for m in obj.modifiers if m.type == "NODES"
+                         and m.node_group and is_ours(m.node_group)), None)
+
+
+def node_tree(mat):
+    """Material.use_nodes is deprecated from 5.0, where every material uses nodes."""
+    if mat is None:
+        return None
+    if bpy.app.version >= (5, 0, 0):
+        return mat.node_tree
+    return mat.node_tree if mat.use_nodes else None
+
+
+def is_hidden(obj):
+    """hide_get() raises for an object outside the view layer on some versions."""
+    layer = bpy.context.view_layer
+    if layer.objects.get(obj.name) != obj:
+        return True
+    try:
+        return obj.hide_get()
+    except RuntimeError:
+        return True
 
 
 def report(obj):
@@ -40,7 +72,7 @@ def report(obj):
     add(f"engine   : {bpy.context.scene.render.engine}")
     add(f"group    : {mod.node_group.name}"
         + ("  <-- pre-1.1 name; reload the file to migrate it"
-           if mod.node_group.name != GROUP else ""))
+           if mod.node_group.name in LEGACY_NAMES else ""))
     add(f"group ver: {group_version(mod.node_group)}  nodes={len(mod.node_group.nodes)}"
         f"  sockets={len(ids)}")
     if group_version(mod.node_group) is None:
@@ -65,13 +97,13 @@ def report(obj):
     add("")
     if tgt:
         ground_on = mod[ids["Displace Ground"]]
-        add(f"target visibility: eye_hidden={tgt.hide_get()} hide_render={tgt.hide_render} "
+        add(f"target visibility: eye_hidden={is_hidden(tgt)} hide_render={tgt.hide_render} "
             f"hide_viewport={tgt.hide_viewport}")
         add(f"Displace Ground  : {ground_on}")
         if ground_on and not tgt.hide_render:
             add("  ^-- target STILL RENDERS while a conformed copy is joined in."
                 " The flat original cuts through the crater at F12 only.")
-        if ground_on and not tgt.hide_get():
+        if ground_on and not is_hidden(tgt):
             add("  ^-- target still draws in the viewport too.")
         if tgt.hide_viewport:
             add("  ^-- hide_viewport (monitor icon) can drop the object from the depsgraph;"
@@ -86,10 +118,10 @@ def report(obj):
     #    node group conforms the ground to a surface the renderer then moves somewhere else.
     add("")
     for mat in (tgt.data.materials if tgt and tgt.data else []) or []:
-        if not mat or not mat.use_nodes:
+        if node_tree(mat) is None:
             continue
         linked = any(n.type == "OUTPUT_MATERIAL" and n.inputs["Displacement"].is_linked
-                     for n in mat.node_tree.nodes)
+                     for n in node_tree(mat).nodes)
         method = getattr(mat, "displacement_method", "BUMP")
         add(f"target material '{mat.name}': displacement_linked={linked} method={method}")
         if linked and method != "BUMP":
@@ -122,7 +154,7 @@ def report(obj):
             add("projected UVs    : " + ("present" if "cb_target_uv" in me.uv_layers else "MISSING"))
 
     mat = obj.active_material
-    if not mat or not mat.use_nodes:
+    if node_tree(mat) is None:
         add("material         : none, or not using nodes")
     else:
         for warning in mat.get("cb_texture_warnings", "").splitlines():

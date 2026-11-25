@@ -26,7 +26,7 @@ LEGACY_NAMES = ("Blend To Surface",)
 # number, so an existing .blend picks up fixes on reload instead of silently running the tree
 # it was first built with -- a stale group is indistinguishable from a bug that did not get
 # fixed, and telling people to delete it by hand is exactly how it survives.
-GROUP_VERSION = 6
+GROUP_VERSION = 7
 # The stamp moved with the rename. An old group carries the value under the old key, so read
 # both and rewrite to the current one -- treating the old key as unstamped would force a
 # needless rebuild, and the diagnostic would report a group of unknown vintage.
@@ -38,6 +38,8 @@ VISIBILITY_KEY = "cb_original_visibility"
 HIDDEN_TARGET_KEY = "cb_hidden_target"
 TARGET_UV_ATTR = "cb_target_uv"
 TEXTURE_DATA_KEY = "cb_texture_data"
+BREAKUP_GROUP = "Contact Blend Breakup"
+BREAKUP_VERSION = 1
 
 
 def _socket(ng, name, stype, in_out="INPUT", **kw):
@@ -81,17 +83,45 @@ def _is_ours(ng):
         group_version(ng) is not None or "Contact Distance" in input_ids(ng))
 
 
-def _legacy_groups():
-    return [ng for ng in (bpy.data.node_groups.get(n) for n in LEGACY_NAMES)
-            if ng is not None and _is_ours(ng)]
+def _our_groups():
+    """Every Contact Blend group in the file, whatever it is called.
+
+    Names are not reliable: appending or linking a blended object into a file that already
+    has the group brings its own copy in as "Contact Blend.001", and a user is free to call an
+    unrelated group "Contact Blend". The stamp (or, for pre-stamp files, the socket layout) is
+    what marks a group as ours. Duplicates are deliberately left alone rather than merged --
+    each one's modifiers keep their own settings, and every one is upgraded the same way.
+    """
+    return [ng for ng in bpy.data.node_groups if _is_ours(ng)]
+
+
+def node_tree(mat):
+    """The node tree that shades `mat`, or None if it is not a node material.
+
+    `Material.use_nodes` is deprecated from 5.0 -- every material is a node material there and
+    reading the flag only prints a warning (it goes away in 6.0). 4.5 still has materials
+    without nodes, so the flag still decides there.
+    """
+    if mat is None:
+        return None
+    if bpy.app.version >= (5, 0, 0):
+        return mat.node_tree
+    return mat.node_tree if mat.use_nodes else None
+
+
+def ensure_node_tree(mat):
+    """Turn `mat` into a node material if it is not one already, and return its tree."""
+    if bpy.app.version < (5, 0, 0) and not mat.use_nodes:
+        mat.use_nodes = True
+    return mat.node_tree
 
 
 def migrate_names():
     """Rename anything this add-on left under a pre-1.1 name. Returns how many it moved.
 
     Only ever renames into a free name: if the current name is already taken the old datablock
-    is left alone rather than being pushed to a `.001` suffix, which would leave two groups
-    that both look current and neither of which the panel could tell apart.
+    is left alone rather than being pushed to a `.001` suffix. That is harmless now that groups
+    are found by stamp rather than by name; build_group() upgrades it either way.
 
     Modifiers are deliberately *not* renamed. Their name is cosmetic here -- find_mod() goes
     by node group -- and a driver written against `modifiers["Blend To Surface"]` would break.
@@ -105,10 +135,11 @@ def migrate_names():
                 _stamp(ng, group_version(ng))
             moved += 1
         for mat in bpy.data.materials:
-            if not mat.use_nodes:
+            tree = node_tree(mat)
+            if tree is None:
                 continue
-            node = mat.node_tree.nodes.get(old)
-            if node and node.type == "MIX_SHADER" and not mat.node_tree.nodes.get(GROUP):
+            node = tree.nodes.get(old)
+            if node and node.type == "MIX_SHADER" and not tree.nodes.get(GROUP):
                 node.name = node.label = GROUP
                 moved += 1
     return moved
@@ -144,21 +175,25 @@ def _rebuild(ng):
 
 
 def build_group():
-    """Return the node group, rebuilding it in place if it predates GROUP_VERSION."""
+    """Return our node group, rebuilding every stale one in place first.
+
+    New modifiers get the group called exactly GROUP if that one is ours, else any of ours,
+    else a fresh one. Every stamped group in the file is upgraded, not just that one: a file
+    that appended a blended object from elsewhere has two, and leaving the second on an old
+    tree would quietly run a version this build knows is wrong.
+    """
     migrate_names()
-    ng = bpy.data.node_groups.get(GROUP)
+    # A group linked from a library is read-only here; its own file upgrades it when opened.
+    ours = [ng for ng in _our_groups() if ng.library is None]
+    for ng in ours:
+        if group_version(ng) != GROUP_VERSION:
+            _rebuild(ng)
+    named = bpy.data.node_groups.get(GROUP)
+    ng = named if named is not None and named in ours else (ours[0] if ours else None)
     if ng is None:
         ng = bpy.data.node_groups.new(GROUP, "GeometryNodeTree")
         _build_group(ng)
         _stamp(ng)
-    elif group_version(ng) != GROUP_VERSION:
-        _rebuild(ng)
-    # A legacy-named group survives migrate_names() only when the current name was already
-    # taken, so two of our groups are live in the same file. Upgrade that one too, rather than
-    # leaving its modifiers evaluating a tree that this build knows is stale.
-    for other in _legacy_groups():
-        if other is not ng and group_version(other) != GROUP_VERSION:
-            _rebuild(other)
     return ng
 
 
@@ -184,14 +219,55 @@ def _build_group(ng):
     _socket(ng, "Ground Material", "NodeSocketMaterial")
 
     link = ng.links.new
-    gin = _node(ng, "NodeGroupInput", -1100, 0)
-    gout = _node(ng, "NodeGroupOutput", 1400, 0)
+    gin = _node(ng, "NodeGroupInput", -1500, 0)
+    gout = _node(ng, "NodeGroupOutput", 1700, 0)
     g = gin.outputs
 
-    obj = _node(ng, "GeometryNodeObjectInfo", -900, -260, transform_space="RELATIVE")
+    def math(x, y, op, a, b=None):
+        m = _node(ng, "ShaderNodeMath", x, y, operation=op)
+        for sock, v in ((m.inputs[0], a), (m.inputs[1], b)):
+            if isinstance(v, (int, float)):
+                sock.default_value = v
+            elif v is not None:
+                link(v, sock)
+        return m.outputs["Value"]
+
+    # --- every distance is in world metres ---
+    # Object Info in RELATIVE space hands us the target in the hero's local frame, so every
+    # Proximity distance below is in hero-local units. Left alone, "0.3 m" means 0.3 world
+    # metres only at scale 1: a hero scaled to 0.1 would get a 3 cm contact band and, in
+    # practice, a blend of 0 everywhere. Divide the user's world-space distances by the hero's
+    # own scale instead. The mean of the absolute axes is exact for uniform scale; under
+    # non-uniform scale no single number converts distances in every direction, so it is an
+    # approximation there.
+    me = _node(ng, "GeometryNodeSelfObject", -1500, 600)
+    me_info = _node(ng, "GeometryNodeObjectInfo", -1300, 600, transform_space="ORIGINAL")
+    link(me.outputs[0], me_info.inputs["Object"])
+    sabs = _node(ng, "ShaderNodeVectorMath", -1100, 600, operation="ABSOLUTE")
+    link(me_info.outputs["Scale"], sabs.inputs[0])
+    smean = _node(ng, "ShaderNodeVectorMath", -900, 600, operation="DOT_PRODUCT")
+    link(sabs.outputs["Vector"], smean.inputs[0])
+    smean.inputs[1].default_value = (1 / 3, 1 / 3, 1 / 3)
+    scale = math(-700, 600, "MAXIMUM", smean.outputs["Value"], 1e-6)
+
+    def local(name, y):
+        return math(-500, y, "DIVIDE", g[name], scale)
+
+    contact = local("Contact Distance", 700)
+    offset = local("Surface Offset", 650)
+    normal_dist = local("Normal Blend Distance", 600)
+    material_dist = local("Material Blend Distance", 550)
+    detail_dist = local("Ground Detail", 500)
+
+    obj = _node(ng, "GeometryNodeObjectInfo", -1300, -260, transform_space="RELATIVE")
     link(g["Target"], obj.inputs["Object"])
-    pos = _node(ng, "GeometryNodeInputPosition", -900, -460)
-    nor = _node(ng, "GeometryNodeInputNormal", -900, -560)
+    # A ground that is itself a scatter or collection instance arrives as instances, which
+    # Proximity and Separate Geometry cannot see into. Realize them, or the blend is empty.
+    realize = _node(ng, "GeometryNodeRealizeInstances", -1100, -260)
+    link(obj.outputs["Geometry"], realize.inputs["Geometry"])
+    raw = realize.outputs["Geometry"]
+    pos = _node(ng, "GeometryNodeInputPosition", -1300, -460)
+    nor = _node(ng, "GeometryNodeInputNormal", -1300, -560)
 
     def ramp(x, y, dist_out, far_socket, near, far):
         """Map proximity distance -> value: `near` at contact, `far` at far_socket range."""
@@ -227,15 +303,15 @@ def _build_group(ng):
             link(b, v.inputs[1])
         if scale is not None:
             link(scale, v.inputs[3])
-        return v.outputs["Vector"]
+        return v.outputs["Value" if op in ("DISTANCE", "DOT_PRODUCT", "LENGTH") else "Vector"]
 
-    d_src, _ = proximity(-700, -260, obj.outputs["Geometry"])
+    d_src, _ = proximity(-900, -260, raw)
 
     # --- 'blend' attribute for mixing materials in the shader (1 at contact, 0 away) ---
     store = _node(ng, "GeometryNodeStoreNamedAttribute", -300, 0, data_type="FLOAT", domain="POINT")
     store.inputs["Name"].default_value = ATTR
     link(g["Geometry"], store.inputs["Geometry"])
-    link(ramp(-500, -700, d_src, g["Material Blend Distance"], 1.0, 0.0), store.inputs["Value"])
+    link(ramp(-500, -700, d_src, material_dist, 1.0, 0.0), store.inputs["Value"])
     src = store.outputs["Geometry"]
 
     # --- target: conform the ground to the object ---
@@ -254,37 +330,48 @@ def _build_group(ng):
     # open the moment either end of the edge it sits on moves -- the midpoint follows the
     # conform, the coarse edge opposite it stays straight, and the gap between them shows as a
     # sliver of background at grazing angles. So the cut has to fall strictly outside the
-    # moving zone. Selecting faces by their centre distance is not enough: a face centred well
-    # clear of Contact Distance can still have a corner inside it.
+    # moving zone, and that includes the new midpoints subdivision puts *on* the cut.
     #
-    # Capture "this vertex cannot move" per point, then read it back per face. Booleans
-    # interpolate point->face with AND, so the captured value on a face means *every* corner
-    # is frozen; NOT of it selects every face with at least one movable corner. Any movable
-    # vertex therefore has all of its faces in the island, which puts it strictly inside --
-    # so every vertex left on the cut is frozen, and the T-junctions there cannot crack.
-    frozen = _node(ng, "ShaderNodeMath", -500, -900, operation="GREATER_THAN")
-    link(d_tgt, frozen.inputs[0])
-    link(g["Contact Distance"], frozen.inputs[1])
-    cap = _node(ng, "GeometryNodeCaptureAttribute", -300, -900, domain="POINT")
-    cap.capture_items.new("BOOLEAN", "frozen")
-    link(obj.outputs["Geometry"], cap.inputs["Geometry"])
-    link(frozen.outputs["Value"], cap.inputs["frozen"])
-    movable = _node(ng, "FunctionNodeBooleanMath", -100, -900, operation="NOT")
-    link(cap.outputs["frozen"], movable.inputs[0])
-    sep = _node(ng, "GeometryNodeSeparateGeometry", 100, -900, domain="FACE")
-    link(cap.outputs["Geometry"], sep.inputs["Geometry"])
-    link(movable.outputs[0], sep.inputs["Selection"])
-    sub = _node(ng, "GeometryNodeSubdivideMesh", 300, -900)
+    # Choosing the island by vertex distance gets neither right: a 4 m quad over a 0.5 m rock
+    # has every corner beyond Contact Distance, so the island is empty and the quad can never
+    # crater however high Contact Subdivisions goes; and an edge between two far corners can
+    # still pass within reach of the object, so its midpoint would move. Test whole faces
+    # instead. Let c be a face's vertex centroid and r = half its perimeter. Every corner v
+    # satisfies |v - c| <= mean_j |v - v_j| <= r (any two corners are joined by a path along
+    # the boundary no longer than half of it), and every other point of the face -- edge
+    # midpoints included -- lies in the hull of the corners, so also within r of c. Distance to
+    # the object is 1-Lipschitz, so d(p) >= d(c) - r for every point p on the face. Put a face
+    # in the island when d(c) - r <= Contact Distance. Then:
+    #   - a face left out has d(p) > Contact Distance everywhere on it, so every vertex on the
+    #     cut -- original or inserted by subdivision -- has conform and detail weight exactly 0;
+    #   - equivalently, any vertex that can move has ALL of its faces in the island, so it sits
+    #     strictly inside and never on the cut.
+    # r is computed as mean edge length * corner count / 2. The edge length is captured on the
+    # edge domain first: evaluated in face context, Edge Vertices would hand back face-averaged
+    # *positions*, not an average of lengths.
+    ends = _node(ng, "GeometryNodeInputMeshEdgeVertices", -700, -1000)
+    edge_len = _node(ng, "GeometryNodeCaptureAttribute", -300, -900, domain="EDGE")
+    edge_len.capture_items.new("FLOAT", "length")
+    link(raw, edge_len.inputs["Geometry"])
+    link(vmath(-500, -1000, "DISTANCE", ends.outputs["Position 1"], ends.outputs["Position 2"]),
+         edge_len.inputs["length"])
+    corners = _node(ng, "GeometryNodeInputMeshFaceNeighbors", -300, -1100)
+    reach = math(-100, -1050, "MULTIPLY",
+                 math(-100, -1150, "MULTIPLY", edge_len.outputs["length"],
+                      corners.outputs["Vertex Count"]), 0.5)
+    clear = math(100, -1000, "GREATER_THAN", math(100, -1100, "SUBTRACT", d_tgt, reach), contact)
+    island = _node(ng, "FunctionNodeBooleanMath", 300, -1000, operation="NOT")
+    link(clear, island.inputs[0])
+    sep = _node(ng, "GeometryNodeSeparateGeometry", 300, -900, domain="FACE")
+    link(edge_len.outputs["Geometry"], sep.inputs["Geometry"])
+    link(island.outputs[0], sep.inputs["Selection"])
+    sub = _node(ng, "GeometryNodeSubdivideMesh", 500, -900)
     link(sep.outputs["Selection"], sub.inputs["Mesh"])
     link(g["Contact Subdivisions"], sub.inputs["Level"])
-    dense = _node(ng, "GeometryNodeJoinGeometry", 500, -900)
-    link(sep.outputs["Inverted"], dense.inputs["Geometry"])
-    link(sub.outputs["Mesh"], dense.inputs["Geometry"])
-    # Separate Geometry duplicates the vertices along the cut, which splits their normals and
-    # would draw a crease ring on any ground that is not dead flat. Weld them back.
-    weld = _node(ng, "GeometryNodeMergeByDistance", 650, -900)
-    link(dense.outputs["Geometry"], weld.inputs["Geometry"])
-    weld.inputs["Distance"].default_value = 1e-5
+
+    # Everything that moves the ground runs on the island alone. The remainder is, by the
+    # argument above, never moved, so evaluating proximity and normals for every vertex of a
+    # half-million-vertex floor only to multiply the result by zero is pure cost.
 
     # --- real height, but only where there are vertices to carry it ---
     # Subdividing the contact island and then not putting anything in it wastes the density:
@@ -302,24 +389,20 @@ def _build_group(ng):
     h = _node(ng, "ShaderNodeMath", 100, -1250, operation="SUBTRACT")
     link(img.outputs["Color"], h.inputs[0])
     link(g["Detail Midlevel"], h.inputs[1])
-    amt = _node(ng, "ShaderNodeMath", 300, -1250, operation="MULTIPLY")
-    link(h.outputs["Value"], amt.inputs[0])
-    link(g["Ground Detail"], amt.inputs[1])
-    amt_masked = _node(ng, "ShaderNodeMath", 500, -1250, operation="MULTIPLY")
-    link(amt.outputs["Value"], amt_masked.inputs[0])
-    link(ramp(300, -1450, d_tgt, g["Contact Distance"], 1.0, 0.0), amt_masked.inputs[1])
-    detail = _node(ng, "GeometryNodeSetPosition", 700, -1250)
-    link(weld.outputs["Geometry"], detail.inputs["Geometry"])
-    link(vmath(500, -1100, "SCALE", nor.outputs["Normal"], scale=amt_masked.outputs["Value"]),
+    amt = math(300, -1250, "MULTIPLY", h.outputs["Value"], detail_dist)
+    amt_masked = math(500, -1250, "MULTIPLY", amt, ramp(300, -1450, d_tgt, contact, 1.0, 0.0))
+    detail = _node(ng, "GeometryNodeSetPosition", 700, -900)
+    link(sub.outputs["Mesh"], detail.inputs["Geometry"])
+    link(vmath(500, -1100, "SCALE", nor.outputs["Normal"], scale=amt_masked),
          detail.inputs["Offset"])
 
-    w = ramp(200, -400, d_tgt, g["Contact Distance"], g["Ground Conform"], 0.0)
+    w = ramp(200, -400, d_tgt, contact, g["Ground Conform"], 0.0)
     # Land slightly *inside* the object rather than exactly on it, so the conformed ground is
     # buried instead of coplanar -- coplanar would z-fight along the whole contact band.
-    sink = vmath(200, -760, "SCALE", sample_normal(0, -760, src), scale=g["Surface Offset"])
+    sink = vmath(200, -760, "SCALE", sample_normal(0, -760, src), scale=offset)
     goal = vmath(400, -700, "SUBTRACT", p_tgt, sink)
     move = vmath(600, -560, "SCALE", vmath(600, -700, "SUBTRACT", goal, pos.outputs["Position"]), scale=w)
-    sp = _node(ng, "GeometryNodeSetPosition", 800, -560)
+    sp = _node(ng, "GeometryNodeSetPosition", 900, -900)
     link(detail.outputs["Geometry"], sp.inputs["Geometry"])
     link(move, sp.inputs["Offset"])
     # Deliberately no Set Shade Smooth here. Forcing the bent faces smooth hides faceting on a
@@ -328,19 +411,48 @@ def _build_group(ng):
     # ground with real surface detail it is a hard crease ring at that radius -- the seam moved
     # rather than went away. Contact Subdivisions fixes the faceting at its source, so the
     # ground keeps whatever shading it came with and nothing discontinuous is introduced.
-    tgt = sp.outputs["Geometry"]
+
+    dense = _node(ng, "GeometryNodeJoinGeometry", 1100, -900)
+    link(sep.outputs["Inverted"], dense.inputs["Geometry"])
+    link(sp.outputs["Geometry"], dense.inputs["Geometry"])
+    # Separate Geometry duplicates the vertices along the cut, which splits their normals and
+    # would draw a crease ring on any ground that is not dead flat. Weld them back -- but only
+    # vertices on an open edge: every cut vertex is on one on both sides of the join (plus the
+    # ground's own rim, which is harmless to include), and merging the whole floor would cost
+    # a KD-tree over every vertex of it. The cut vertices are frozen, so both copies are still
+    # bit-identical and the tiny distance is enough.
+    open_edges = _node(ng, "GeometryNodeInputMeshEdgeNeighbors", 1100, -1100)
+    is_open = math(1100, -1200, "COMPARE", open_edges.outputs["Face Count"], 1.0)
+    is_open.node.inputs[2].default_value = 0.5
+    cut = _node(ng, "GeometryNodeCaptureAttribute", 1300, -900, domain="EDGE")
+    cut.capture_items.new("BOOLEAN", "open")
+    link(dense.outputs["Geometry"], cut.inputs["Geometry"])
+    link(is_open, cut.inputs["open"])
+    weld = _node(ng, "GeometryNodeMergeByDistance", 1500, -900)
+    link(cut.outputs["Geometry"], weld.inputs["Geometry"])
+    # Booleans adapt edge -> point with OR, so a vertex is selected if any of its edges is open.
+    link(cut.outputs["open"], weld.inputs["Selection"])
+    weld.inputs["Distance"].default_value = 1e-5
+    tgt = weld.outputs["Geometry"]
+
+    # What the hero's shading reads the ground from. With Displace Ground on, the conformed
+    # ground it is welded to; with it off, no ground copy is drawn, so welding normals or
+    # sampling UVs from one would match the hero to a surface that is not there -- read the
+    # raw target instead. Switch only evaluates the branch it picks, so with Displace Ground
+    # off nothing above (island, subdivision, conform, weld) is computed at all.
+    ground = _node(ng, "GeometryNodeSwitch", 1100, -1600, input_type="GEOMETRY")
+    link(g["Displace Ground"], ground.inputs[0])
+    link(raw, ground.inputs[1])
+    link(tgt, ground.inputs[2])
+    shade_ref = ground.outputs["Output"]
 
     # Sample UVs from the final conformed ground, whose original corner UVs have survived
     # subdivision and displacement. Sampling before the conform makes the two sides slide
     # apart. Keep this downstream of the conform to avoid a source/target dependency cycle.
-    uv_geo = _node(ng, "GeometryNodeSwitch", 850, -1600, input_type="GEOMETRY")
-    link(g["Displace Ground"], uv_geo.inputs[0])
-    link(obj.outputs["Geometry"], uv_geo.inputs[1])
-    link(tgt, uv_geo.inputs[2])
     target_uv = _node(ng, "GeometryNodeInputNamedAttribute", 850, -1800, data_type="FLOAT_VECTOR")
     link(g["Target UV Map"], target_uv.inputs["Name"])
-    sample_uv = _node(ng, "GeometryNodeSampleNearestSurface", 1050, -1600, data_type="FLOAT_VECTOR")
-    link(uv_geo.outputs["Output"], sample_uv.inputs["Mesh"])
+    sample_uv = _node(ng, "GeometryNodeSampleNearestSurface", 1050, -1800, data_type="FLOAT_VECTOR")
+    link(shade_ref, sample_uv.inputs["Mesh"])
     link(target_uv.outputs["Attribute"], sample_uv.inputs["Value"])
     link(pos.outputs["Position"], sample_uv.inputs["Sample Position"])
     mapped_src = _node(ng, "GeometryNodeStoreNamedAttribute", 1250, -1600,
@@ -352,7 +464,21 @@ def _build_group(ng):
     link(g["Match Target Textures"], uv_switch.inputs[0])
     link(src, uv_switch.inputs[1])
     link(mapped_src.outputs["Geometry"], uv_switch.inputs[2])
-    shaded_src = uv_switch.outputs["Output"]
+
+    # --- weld the shading: near the target, adopt the target's normal ---
+    # Measured on the hero alone and captured, rather than evaluated on the joined mesh: there
+    # it would run two nearest-surface queries for every corner of the ground copy too, only
+    # to have each one find itself. Corners of the ground carry weight 0 after the join (a
+    # captured attribute missing from one side of a join reads as zero), so they keep exactly
+    # their own normal.
+    weld_n = _node(ng, "GeometryNodeCaptureAttribute", 1450, -1300, domain="CORNER")
+    weld_n.capture_items.new("FLOAT", "weight")
+    weld_n.capture_items.new("VECTOR", "normal")
+    link(uv_switch.outputs["Output"], weld_n.inputs["Geometry"])
+    link(ramp(1250, -1250, proximity(1050, -1250, shade_ref)[0], normal_dist, 1.0, 0.0),
+         weld_n.inputs["weight"])
+    link(sample_normal(1050, -1400, shade_ref), weld_n.inputs["normal"])
+    shaded_src = weld_n.outputs["Geometry"]
 
     # Object/Generated coordinates on joined ground otherwise use the hero's transform
     # and texture space. Replace only the active target material with a corrected copy.
@@ -367,25 +493,24 @@ def _build_group(ng):
     link(tgt, ground_switch.inputs[1])
     link(ground_mat.outputs["Geometry"], ground_switch.inputs[2])
 
-    join = _node(ng, "GeometryNodeJoinGeometry", 700, -100)
+    join = _node(ng, "GeometryNodeJoinGeometry", 1300, -100)
     link(ground_switch.outputs["Output"], join.inputs["Geometry"])
     link(shaded_src, join.inputs["Geometry"])
-    sw = _node(ng, "GeometryNodeSwitch", 900, 0, input_type="GEOMETRY")
+    sw = _node(ng, "GeometryNodeSwitch", 1450, 0, input_type="GEOMETRY")
     link(g["Displace Ground"], sw.inputs[0])
     link(shaded_src, sw.inputs[1])
     link(join.outputs["Geometry"], sw.inputs[2])
 
-    # --- weld the shading: near the target, adopt the target's normal ---
-    mix = _node(ng, "ShaderNodeMix", 1100, -1000, data_type="VECTOR")
-    link(ramp(900, -1250, proximity(700, -1250, tgt)[0], g["Normal Blend Distance"], 0.0, 1.0), mix.inputs[0])
-    link(sample_normal(700, -1000, tgt), mix.inputs[4])
-    link(nor.outputs["Normal"], mix.inputs[5])
+    mix = _node(ng, "ShaderNodeMix", 1450, -1000, data_type="VECTOR")
+    link(weld_n.outputs["weight"], mix.inputs[0])
+    link(nor.outputs["Normal"], mix.inputs[4])
+    link(weld_n.outputs["normal"], mix.inputs[5])
 
     # CORNER, not POINT: `FREE` mode has no selection input, so the custom normal is
     # written mesh-wide. On POINT that replaces every corner normal with the averaged
     # vertex normal and flattens sharp edges into a blob. On CORNER, Input Normal is the
     # existing corner normal, so far from the target the write is a no-op.
-    sn = _node(ng, "GeometryNodeSetMeshNormal", 1250, 0, mode="FREE", domain="CORNER")
+    sn = _node(ng, "GeometryNodeSetMeshNormal", 1600, 0, mode="FREE", domain="CORNER")
     link(sw.outputs["Output"], sn.inputs["Mesh"])
     link(mix.outputs[1], sn.inputs["Custom Normal"])
     link(sn.outputs["Mesh"], gout.inputs[0])
@@ -394,16 +519,100 @@ def _build_group(ng):
 
 def _surface(mat):
     """Active output node of `mat` and the socket feeding its Surface, or (None, None)."""
-    if not mat or not mat.use_nodes:
+    tree = node_tree(mat)
+    if tree is None:
         return None, None
-    out = next((n for n in mat.node_tree.nodes
+    out = next((n for n in tree.nodes
                 if n.type == "OUTPUT_MATERIAL" and n.is_active_output), None)
     if not out or not out.inputs["Surface"].is_linked:
         return None, None
     return out, out.inputs["Surface"].links[0].from_socket
 
 
-_SKIP_PROPS = {"rna_type", "name", "parent", "internal_links", "dimensions", "select", "location"}
+_SKIP_PROPS = {"rna_type", "name", "parent", "internal_links", "dimensions", "select",
+               "location", "location_absolute"}
+
+
+def _copy_struct(src, dst, depth=0):
+    """Copy every setting of RNA struct `src` onto `dst`.
+
+    Plain writable properties are assigned. A lot of node state is not plain, though: ColorRamp,
+    CurveMapping, ImageUser, ColorMapping and TexMapping hang off read-only pointers, so a loop
+    over writable properties walks straight past them and the copy silently comes back with a
+    default black-to-white ramp, a straight curve, or frame 1 of an image sequence. Recurse into
+    every read-only pointer that holds a settings struct (never an ID: those are shared
+    datablocks and are assigned, not copied into). The two that also carry a *collection* --
+    ramp elements and curve points -- cannot be reached generically and are rebuilt by hand.
+    """
+    for prop in src.bl_rna.properties:
+        ident = prop.identifier
+        if ident in _SKIP_PROPS or prop.type == "COLLECTION":
+            continue
+        value = getattr(src, ident)
+        if prop.type == "POINTER" and prop.is_readonly:
+            if value is not None and not isinstance(value, bpy.types.ID) and depth < 4:
+                _copy_struct(value, getattr(dst, ident), depth + 1)
+            continue
+        if prop.is_readonly:
+            continue
+        try:
+            setattr(dst, ident, value)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pass
+    if isinstance(src, bpy.types.ColorRamp):
+        _copy_color_ramp(src, dst)
+    elif isinstance(src, bpy.types.CurveMapping):
+        _copy_curve_mapping(src, dst)
+
+
+def _copy_color_ramp(src, dst):
+    elements = dst.elements
+    # A ramp cannot drop below one element, and new() inserts sorted by position, so shrink to
+    # one, overwrite it, and let new() place the rest.
+    while len(elements) > 1:
+        elements.remove(elements[-1])
+    first = src.elements[0]
+    elements[0].position = first.position
+    elements[0].color = first.color
+    for element in list(src.elements)[1:]:
+        elements.new(element.position).color = element.color
+
+
+def _copy_curve_mapping(src, dst):
+    for src_curve, dst_curve in zip(src.curves, dst.curves):
+        points = dst_curve.points
+        while len(points) < len(src_curve.points):
+            points.new(0.5, 0.5)
+        while len(points) > len(src_curve.points):
+            points.remove(points[-1])
+        # Source points are already sorted; assign in order and let update() re-sort once.
+        for a, b in zip(src_curve.points, points):
+            b.location = a.location
+            b.handle_type = a.handle_type
+    dst.update()
+
+
+def _absolute_location(node):
+    if hasattr(node, "location_absolute"):
+        return tuple(node.location_absolute)
+    x, y = node.location
+    parent = node.parent
+    while parent is not None:
+        x, y = x + parent.location[0], y + parent.location[1]
+        parent = parent.parent
+    return x, y
+
+
+def _set_absolute_location(node, xy):
+    if hasattr(node, "location_absolute"):
+        node.location_absolute = xy
+        return
+    px = py = 0.0
+    parent = node.parent
+    while parent is not None:
+        px, py = px + parent.location[0], py + parent.location[1]
+        parent = parent.parent
+    node.location = (xy[0] - px, xy[1] - py)
 
 
 def _copy_nodes(src_tree, dst_tree, offset):
@@ -413,20 +622,27 @@ def _copy_nodes(src_tree, dst_tree, offset):
         if n.type == "OUTPUT_MATERIAL":
             continue
         c = dst_tree.nodes.new(n.bl_idname)
-        for p in n.bl_rna.properties:
-            if p.is_readonly or p.identifier in _SKIP_PROPS:
-                continue
-            try:
-                setattr(c, p.identifier, getattr(n, p.identifier))
-            except Exception:
-                pass
-        c.location = (n.location[0] + offset[0], n.location[1] + offset[1])
+        _copy_struct(n, c)
         for a, b in zip(n.inputs, c.inputs):
             try:
                 b.default_value = a.default_value
             except Exception:
                 pass
+        # RGB and Value nodes keep their value on the *output* socket.
+        for a, b in zip(n.outputs, c.outputs):
+            try:
+                b.default_value = a.default_value
+            except Exception:
+                pass
         m[n] = c
+    # Parent only once every frame exists, then place by absolute location: a child's
+    # `location` is relative to its frame, so offsetting it as if absolute would shift it twice.
+    for n, c in m.items():
+        if n.parent in m:
+            c.parent = m[n.parent]
+    for n, c in m.items():
+        x, y = _absolute_location(n)
+        _set_absolute_location(c, (x + offset[0], y + offset[1]))
     for l in src_tree.links:
         f, t = m.get(l.from_node), m.get(l.to_node)
         if not f or not t:
@@ -548,7 +764,8 @@ def _cleanup_texture_data():
         if mat.get(TEXTURE_DATA_KEY) and mat.users == 0:
             bpy.data.materials.remove(mat)
     while True:
-        unused = [ng for ng in bpy.data.node_groups if ng.get(TEXTURE_DATA_KEY) and ng.users == 0]
+        unused = [ng for ng in bpy.data.node_groups if ng.users == 0
+                  and (ng.get(TEXTURE_DATA_KEY) or ng.get(GENERATED_KEY) == "breakup")]
         if not unused:
             break
         for ng in unused:
@@ -569,15 +786,125 @@ def _texture_settings(src, tgt):
 
 
 def _material_mix(mat):
-    if not mat or not mat.use_nodes:
+    tree = node_tree(mat)
+    if tree is None:
         return None
-    nodes = mat.node_tree.nodes
+    nodes = tree.nodes
     tagged = next((n for n in nodes if n.type == "MIX_SHADER"
                    and n.get(GENERATED_KEY) == "mix"), None)
     if tagged:
         return tagged
     return next((n for n in nodes if n.type == "MIX_SHADER"
                  and not n.get(GENERATED_KEY) and n.name in (GROUP,) + LEGACY_NAMES), None)
+
+
+def _build_breakup(ng):
+    """Edge breakup: roughen the linear `blend` ramp without moving its ends.
+
+    The geometry hands the shader a smooth per-vertex ramp, which reads as an airbrushed band.
+    Push it around with noise, scaled by an envelope b*(1-b) that is exactly 0 at b=0 and b=1:
+    however strong the breakup, nothing speckles far from the contact (b=0) and nothing
+    punches holes where the object meets the ground (b=1). Sharpness then steepens the result
+    around 0.5. With Breakup and Sharpness at their default 0 every step reduces to the
+    identity exactly -- b + 0, then a map range from [0, 1] to [0, 1] -- so adding this node
+    to an existing material changes nothing until someone turns it up.
+
+    Noise is in Object space, so it is the hero's own coordinates: it does not swim when UVs
+    change, and it moves with the object rather than with the camera.
+    """
+    _socket(ng, "Blend", "NodeSocketFloat", "OUTPUT")
+    _socket(ng, "Blend", "NodeSocketFloat", default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")
+    _socket(ng, "Noise Scale", "NodeSocketFloat", default_value=5.0, min_value=0.0)
+    _socket(ng, "Breakup", "NodeSocketFloat", default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")
+    _socket(ng, "Sharpness", "NodeSocketFloat", default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")
+    link = ng.links.new
+    gin = _node(ng, "NodeGroupInput", -900, 0)
+    gout = _node(ng, "NodeGroupOutput", 900, 0)
+    g = gin.outputs
+
+    def math(x, y, op, a, b, clamp=False):
+        m = _node(ng, "ShaderNodeMath", x, y, operation=op, use_clamp=clamp)
+        for sock, v in ((m.inputs[0], a), (m.inputs[1], b)):
+            if isinstance(v, (int, float)):
+                sock.default_value = v
+            else:
+                link(v, sock)
+        return m.outputs["Value"]
+
+    coord = _node(ng, "ShaderNodeTexCoord", -900, -300)
+    noise = _node(ng, "ShaderNodeTexNoise", -700, -300)
+    link(coord.outputs["Object"], noise.inputs["Vector"])
+    link(g["Noise Scale"], noise.inputs["Scale"])
+    centred = math(-500, -300, "SUBTRACT", noise.outputs["Fac"], 0.5)
+    envelope = math(-500, 0, "MULTIPLY", g["Blend"], math(-700, 100, "SUBTRACT", 1.0, g["Blend"]))
+    # Noise Fac sits roughly in 0.2..0.8, so *8 lets Breakup = 1 swing the middle of the ramp
+    # (envelope 0.25) all the way to 0 or 1.
+    delta = math(-100, -200, "MULTIPLY",
+                 math(-300, -200, "MULTIPLY", math(-300, -350, "MULTIPLY", centred, g["Breakup"]),
+                      envelope), 8.0)
+    broken = math(100, 0, "ADD", g["Blend"], delta, clamp=True)
+    # 0.49, not 0.5: at Sharpness 1 the window is [0.49, 0.51] -- a hard edge, but never a
+    # zero-width range to divide by.
+    lo = math(100, -300, "MULTIPLY", g["Sharpness"], 0.49)
+    hi = math(300, -300, "SUBTRACT", 1.0, lo)
+    mr = _node(ng, "ShaderNodeMapRange", 500, 0, interpolation_type="LINEAR", clamp=True)
+    link(broken, mr.inputs[0])
+    link(lo, mr.inputs[1])
+    link(hi, mr.inputs[2])
+    mr.inputs[3].default_value = 0.0
+    mr.inputs[4].default_value = 1.0
+    link(mr.outputs[0], gout.inputs["Blend"])
+
+
+def breakup_group():
+    """The shared edge-breakup shader group, found by its stamp and created on first use."""
+    ng = next((ng for ng in bpy.data.node_groups if ng.bl_idname == "ShaderNodeTree"
+               and ng.get(GENERATED_KEY) == "breakup"), None)
+    if ng is None:
+        ng = bpy.data.node_groups.new(BREAKUP_GROUP, "ShaderNodeTree")
+        ng[GENERATED_KEY] = "breakup"
+        _build_breakup(ng)
+        ng[VERSION_KEY] = BREAKUP_VERSION
+    return ng
+
+
+def _is_breakup(node):
+    return node.type == "GROUP" and node.get(GENERATED_KEY) == "breakup"
+
+
+def breakup_node(mat):
+    """The edge-breakup node in `mat`, whose inputs are the user's breakup settings, or None."""
+    tree = node_tree(mat)
+    return next((n for n in tree.nodes if _is_breakup(n)), None) if tree else None
+
+
+def _wire_breakup(tree, mix_name):
+    """Put a breakup node between the `blend` Attribute node and the mix factor.
+
+    Only when the factor still comes straight from that Attribute node -- the layout every
+    earlier release built. If the user has rewired it, that wiring is theirs; leave it alone.
+    """
+    socket = tree.nodes[mix_name].inputs[0]
+    if not socket.is_linked:
+        return None
+    upstream = socket.links[0].from_node
+    if _is_breakup(upstream):
+        return upstream
+    if upstream.type != "ATTRIBUTE" or upstream.attribute_name != ATTR:
+        return None
+    attr_name = upstream.name
+    out_idx = list(upstream.outputs).index(socket.links[0].from_socket)
+    ax, ay = upstream.location
+    mx = tree.nodes[mix_name].location[0]
+    node = tree.nodes.new("ShaderNodeGroup")
+    node.node_tree = breakup_group()
+    node[GENERATED_KEY] = "breakup"
+    node.label = "Edge Breakup"
+    node.location = ((ax + mx) / 2, ay - 150)
+    name = node.name
+    tree.links.new(tree.nodes[attr_name].outputs[out_idx], tree.nodes[name].inputs["Blend"])
+    tree.links.new(tree.nodes[name].outputs["Blend"], tree.nodes[mix_name].inputs[0])
+    return tree.nodes[name]
 
 
 def _private_material(src, slot):
@@ -617,21 +944,56 @@ def _prune_generated(tree, names):
 def setup_material(src, tgt, refresh=False):
     """Mix the target's shader into the source's, driven by the `blend` attribute.
 
-    Returns a message on failure, None on success. Idempotent: the mix node is named
-    GROUP, so re-running on an already-wired material is a no-op. Explicit refresh
-    replaces only the generated target branch, preserving the source shader and user nodes.
+    Every slot of the source holding a node material with a linked Surface is blended, each in
+    its own private copy: a rock with a separate moss or cap material has those faces touching
+    the ground too, and blending only the active slot left them ending in a hard line there.
+    Slots without a usable material are skipped; this fails only when none is usable. The
+    target always contributes its active material.
+
+    Returns a message on failure, None on success. Idempotent: an already-wired material is
+    left alone. Explicit refresh replaces only the generated target branch, preserving the
+    source shader, user nodes and breakup settings.
     """
     if src is tgt:
         return "The blend object cannot be its own target"
-    smat, tmat = src.active_material, tgt.active_material
-    sout, sshader = _surface(smat)
+    tmat = tgt.active_material
     _, tshader = _surface(tmat)
-    if not sshader:
+    if not any(_surface(slot.material)[1] for slot in src.material_slots):
         return f"'{src.name}' has no node material with a linked Surface"
     if not tshader:
         return f"'{tgt.name}' has no node material with a linked Surface"
-    smat = _private_material(src, src.material_slots[src.active_material_index])
+    match_textures, uv_name, mod = _texture_settings(src, tgt)
+    groups, done, changed = {}, set(), False
+    for slot in src.material_slots:
+        if not _surface(slot.material)[1]:
+            continue
+        smat = _private_material(src, slot)
+        if smat.as_pointer() in done:     # one private material sitting in several slots
+            continue
+        done.add(smat.as_pointer())
+        changed |= _blend_material(smat, tmat, tgt, match_textures, uv_name, groups, refresh)
+    if mod and changed:
+        ids = input_ids(mod.node_group)
+        ground = tmat
+        if match_textures:
+            ground = tmat.copy()
+            ground.name = tmat.name + " (Contact Blend Ground)"
+            ground.use_fake_user = False
+            ground[TEXTURE_DATA_KEY] = True
+            _match_texture_nodes(ground.node_tree, tgt, uv_name, False)
+        mod[ids["Target Material"]] = tmat
+        mod[ids["Ground Material"]] = ground
+    _cleanup_texture_data()
+    return None
+
+
+def _blend_material(smat, tmat, tgt, match_textures, uv_name, groups, refresh):
+    """Wire (or, on refresh, re-copy) the target shader into one private source material.
+
+    Returns True if anything was changed.
+    """
     sout, sshader = _surface(smat)
+    _, tshader = _surface(tmat)
     st = smat.node_tree
     # Also recognise the pre-1.1 node name, and move it forward while we are here. Missing it
     # would not raise -- it would silently mix a second copy of the target shader into a
@@ -640,7 +1002,7 @@ def setup_material(src, tgt, refresh=False):
     if mix:
         mix.name = mix.label = GROUP
         if not refresh:
-            return None
+            return False
 
     # nodes.new() can invalidate existing RNA pointers, so note how to find the sockets
     # again by name+index and re-resolve them after every node has been created
@@ -655,35 +1017,24 @@ def setup_material(src, tgt, refresh=False):
     for node in m.values():
         node[GENERATED_KEY] = "target"
     copy_name = m[tmat.node_tree.nodes[tgt_name]].name
-    match_textures, uv_name, mod = _texture_settings(src, tgt)
     warnings = set()
     if match_textures:
-        warnings = _match_texture_nodes(st, tgt, uv_name, True,
+        warnings = _match_texture_nodes(st, tgt, uv_name, True, groups=groups,
                                        node_names={node.name for node in m.values()})
     smat["cb_texture_warnings"] = "\n".join(sorted(warnings))
-    if mod:
-        ids = input_ids(mod.node_group)
-        ground = tmat
-        if match_textures:
-            ground = tmat.copy()
-            ground.name = tmat.name + " (Contact Blend Ground)"
-            ground.use_fake_user = False
-            ground[TEXTURE_DATA_KEY] = True
-            _match_texture_nodes(ground.node_tree, tgt, uv_name, False)
-        mod[ids["Target Material"]] = tmat
-        mod[ids["Ground Material"]] = ground
     if mix_name:
         st.links.new(st.nodes[copy_name].outputs[tgt_idx], st.nodes[mix_name].inputs[2])
         _prune_generated(st, old_target_nodes)
-        _cleanup_texture_data()
-        return None
+        # Materials wired before edge breakup existed get it here, on their next Update.
+        _wire_breakup(st, mix_name)
+        return True
     base = tuple(st.nodes[out_name].location)
 
     attr = st.nodes.new("ShaderNodeAttribute")
     attr.attribute_type = "GEOMETRY"
     attr.attribute_name = ATTR
     attr[GENERATED_KEY] = "attribute"
-    attr.location = (base[0] - 500, base[1] - 400)
+    attr.location = (base[0] - 700, base[1] - 400)
     attr_name = attr.name
     mix = st.nodes.new("ShaderNodeMixShader")
     mix.name = mix.label = GROUP
@@ -696,8 +1047,8 @@ def setup_material(src, tgt, refresh=False):
     st.links.new(n[sh_name].outputs[sh_idx], mix.inputs[1])     # blend=0: source shader
     st.links.new(n[copy_name].outputs[tgt_idx], mix.inputs[2])  # blend=1: target shader
     st.links.new(mix.outputs[0], n[out_name].inputs["Surface"])
-    _cleanup_texture_data()
-    return None
+    _wire_breakup(st, mix_name)
+    return True
 
 
 def remove_material_blend(src):
@@ -728,17 +1079,52 @@ def input_ids(ng):
             if i.item_type == "SOCKET" and i.in_out == "INPUT"}
 
 
+def _is_blend_mod(mod):
+    # By stamp, not by name: an appended object brings its group in as "Contact Blend.001",
+    # and a pre-1.1 file still has "Blend To Surface" until migrate_names() runs -- enabling
+    # the add-on after the file is already open misses the load handler entirely.
+    return mod.type == "NODES" and mod.node_group is not None and _is_ours(mod.node_group)
+
+
 def find_mod(obj):
-    # Legacy names included so the panel still finds the modifier in the window between a
-    # pre-1.1 file being opened and migrate_names() running -- enabling the add-on after the
-    # file is already open misses the load handler entirely.
-    names = (GROUP,) + LEGACY_NAMES
-    return obj and next((m for m in obj.modifiers if m.type == "NODES"
-                         and m.node_group and m.node_group.name in names), None)
+    return obj and next((m for m in obj.modifiers if _is_blend_mod(m)), None)
 
 
 def mod_target(mod):
     return mod[input_ids(mod.node_group)["Target"]] if mod and mod.node_group else None
+
+
+def _in_layer(obj, layer):
+    return layer is not None and layer.objects.get(obj.name) == obj
+
+
+def is_hidden(obj, layer=None):
+    """`obj.hide_get()` that cannot raise.
+
+    The target need not be in the current view layer at all -- it can live in an excluded
+    collection or in another scene and still be read by Object Info. hide_get()/hide_set()
+    raise for such an object (hide_set always, hide_get on some versions), and this is called
+    from panel draw and operator polls, where an exception breaks the whole sidebar. An
+    object that is not in the layer cannot draw there, so it counts as hidden.
+    """
+    layer = layer or bpy.context.view_layer
+    if not _in_layer(obj, layer):
+        return True
+    try:
+        return obj.hide_get(view_layer=layer)
+    except RuntimeError:
+        return True
+
+
+def _set_hidden(obj, state, layer):
+    """hide_set() that skips, rather than aborts on, an object outside `layer`."""
+    if not _in_layer(obj, layer):
+        return False
+    try:
+        obj.hide_set(state, view_layer=layer)
+    except RuntimeError:
+        return False
+    return True
 
 
 def _hide_target(tgt, ctx):
@@ -748,11 +1134,13 @@ def _hide_target(tgt, ctx):
     state = tgt[VISIBILITY_KEY]
     recorded = any(saved.get("scene") == ctx.scene and saved["layer"] == ctx.view_layer.name
                    for saved in state["layers"].values())
-    if not recorded:
+    # Outside this view layer there is no eye flag to record or set; the render flag below
+    # still applies, and the rest of the operator must not be skipped over it.
+    if not recorded and _in_layer(tgt, ctx.view_layer):
         key = str(len(state["layers"]))
         state["layers"][key] = {"scene": ctx.scene, "layer": ctx.view_layer.name,
-                                "hidden": tgt.hide_get(view_layer=ctx.view_layer)}
-    tgt.hide_set(True, view_layer=ctx.view_layer)
+                                "hidden": is_hidden(tgt, ctx.view_layer)}
+    _set_hidden(tgt, True, ctx.view_layer)
     tgt.hide_render = True
 
 
@@ -762,8 +1150,7 @@ def _restore_target(tgt):
         return
     for obj in bpy.data.objects:
         for mod in obj.modifiers:
-            if (mod.type == "NODES" and mod.node_group
-                    and mod.node_group.name in (GROUP,) + LEGACY_NAMES
+            if (_is_blend_mod(mod)
                     and mod_target(mod) == tgt
                     and mod[input_ids(mod.node_group)["Displace Ground"]]):
                 return
@@ -774,8 +1161,8 @@ def _restore_target(tgt):
     for saved in state["layers"].values():
         scene = saved.get("scene")
         layer = scene.view_layers.get(saved["layer"]) if scene else None
-        if layer and tgt.hide_get(view_layer=layer):
-            tgt.hide_set(saved["hidden"], view_layer=layer)
+        if layer and _in_layer(tgt, layer) and is_hidden(tgt, layer):
+            _set_hidden(tgt, saved["hidden"], layer)
     del tgt[VISIBILITY_KEY]
 
 
@@ -802,7 +1189,7 @@ def target_leaks(mod):
     tgt = mod_target(mod)
     if not tgt or not mod[input_ids(mod.node_group)["Displace Ground"]]:
         return None
-    return tgt if (not tgt.hide_render or not tgt.hide_get()) else None
+    return tgt if (not tgt.hide_render or not is_hidden(tgt)) else None
 
 
 def target_displaces(mod):
@@ -817,14 +1204,55 @@ def target_displaces(mod):
     tgt = mod_target(mod)
     out = []
     for mat in (tgt.data.materials if tgt and tgt.data else []) or []:
-        if not mat or not mat.use_nodes:
+        tree = node_tree(mat)
+        if tree is None:
             continue
         if getattr(mat, "displacement_method", "BUMP") == "BUMP":
             continue
         if any(n.type == "OUTPUT_MATERIAL" and n.inputs["Displacement"].is_linked
-               for n in mat.node_tree.nodes):
+               for n in tree.nodes):
             out.append(mat)
     return out
+
+
+def object_width(obj):
+    """Smaller horizontal (world X/Y) extent of `obj`'s own mesh, in metres, or None.
+
+    Measured from the mesh data, not the evaluated object: once the blend exists the evaluated
+    mesh has the whole ground joined into it. The smaller side, so a long log or a thin wall
+    gets a contact band sized to its thickness rather than to its length.
+    """
+    import numpy as np
+    if obj.type != "MESH" or not obj.data.vertices:
+        return None
+    co = np.empty(len(obj.data.vertices) * 3, dtype=np.float64)
+    obj.data.vertices.foreach_get("co", co)
+    m = np.array(obj.matrix_world, dtype=np.float64)
+    world = co.reshape(-1, 3) @ m[:3, :3].T + m[:3, 3]
+    extent = world.max(axis=0) - world.min(axis=0)
+    return float(min(extent[0], extent[1]))
+
+
+def fit_to_object(mod, obj):
+    """Size the distance settings to `obj`, so a pebble and a boulder both start sensibly.
+
+    A fixed 0.3 m Contact Distance swallows a 5 cm pebble whole and is invisible under a 20 m
+    boulder. Contact Distance ~1/3 of the width matches the advice that always went with it;
+    the rest follow in proportion (Surface Offset lands on the old 0.002 m for a ~0.5 m
+    object). Only ever called on a new blend or on explicit request: on Update or a re-apply
+    these are the user's values.
+    """
+    width = object_width(obj)
+    if not width:
+        return False
+    ids = input_ids(mod.node_group)
+    contact = min(max(width / 3, 0.001), 50.0)
+    mod[ids["Contact Distance"]] = contact
+    mod[ids["Material Blend Distance"]] = contact
+    mod[ids["Normal Blend Distance"]] = contact * 2 / 3
+    mod[ids["Surface Offset"]] = min(max(contact * 0.012, 1e-5), 0.05)
+    obj.update_tag()
+    return True
 
 
 class CONTACTBLEND_OT_add(bpy.types.Operator):
@@ -852,6 +1280,7 @@ class CONTACTBLEND_OT_add(bpy.types.Operator):
         if not mod:
             mod = src.modifiers.new(GROUP, "NODES")
             mod.node_group = ng
+            fit_to_object(mod, src)
         mod[input_ids(mod.node_group)["Target"]] = tgt
         src.update_tag()
         # The conformed ground is joined in as a copy, because a modifier on the target that
@@ -894,6 +1323,27 @@ class CONTACTBLEND_OT_update(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class CONTACTBLEND_OT_fit(bpy.types.Operator):
+    """Size Contact Distance, blend distances and Surface Offset to the object's width"""
+    bl_idname = "object.contact_blend_fit"
+    bl_label = "Fit To Object Size"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, ctx):
+        return find_mod(ctx.active_object) is not None
+
+    def execute(self, ctx):
+        src = ctx.active_object
+        mod = find_mod(src)
+        if not fit_to_object(mod, src):
+            self.report({"ERROR"}, f"'{src.name}' has no vertices to measure")
+            return {"CANCELLED"}
+        cd = mod[input_ids(mod.node_group)["Contact Distance"]]
+        self.report({"INFO"}, f"Contact Distance {cd:.4g} m for '{src.name}'")
+        return {"FINISHED"}
+
+
 class CONTACTBLEND_OT_remove(bpy.types.Operator):
     """Remove the blend, preserving material edits and restoring recorded target visibility"""
     bl_idname = "object.contact_blend_remove"
@@ -922,7 +1372,7 @@ class CONTACTBLEND_OT_remove(bpy.types.Operator):
 
 
 class CONTACTBLEND_OT_material(bpy.types.Operator):
-    """Refresh the target's shader in an isolated copy of the active source material"""
+    """Refresh the target's shader in isolated copies of the source's node materials"""
     bl_idname = "object.contact_blend_material"
     bl_label = "Blend Materials"
     bl_options = {"REGISTER", "UNDO"}
@@ -1001,6 +1451,7 @@ class CONTACTBLEND_PT_panel(bpy.types.Panel):
         row = col.row(align=True)
         row.operator(CONTACTBLEND_OT_update.bl_idname, icon="FILE_REFRESH")
         row.operator(CONTACTBLEND_OT_remove.bl_idname, icon="X")
+        col.operator(CONTACTBLEND_OT_fit.bl_idname, icon="FULLSCREEN_ENTER")
         col.separator()
         ids = input_ids(mod.node_group)
         for label, names in (
@@ -1052,7 +1503,8 @@ class CONTACTBLEND_PT_panel(bpy.types.Panel):
             box.operator(CONTACTBLEND_OT_bump_only.bl_idname, icon="MOD_SMOOTH")
 
 
-_classes = (CONTACTBLEND_OT_add, CONTACTBLEND_OT_update, CONTACTBLEND_OT_remove,
+_classes = (CONTACTBLEND_OT_add, CONTACTBLEND_OT_update, CONTACTBLEND_OT_fit,
+            CONTACTBLEND_OT_remove,
             CONTACTBLEND_OT_material, CONTACTBLEND_OT_hide_target,
             CONTACTBLEND_OT_bump_only, CONTACTBLEND_PT_panel)
 
@@ -1068,7 +1520,7 @@ def _on_load(_):
     Deliberately does nothing in a file that has never used the add-on: build_group() would
     otherwise create the node group in every file that gets opened.
     """
-    if migrate_names() or bpy.data.node_groups.get(GROUP):
+    if migrate_names() or _our_groups():
         build_group()
 
 
@@ -1101,7 +1553,7 @@ def _selftest():
     bpy.ops.mesh.primitive_grid_add(size=4, x_subdivisions=40, y_subdivisions=40)
     ground = bpy.context.active_object
     gmat = bpy.data.materials.new("ground")
-    gmat.use_nodes = True
+    ensure_node_tree(gmat)
     gmat.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (1, 0, 0, 1)
     ground.data.materials.append(gmat)
 
@@ -1113,7 +1565,7 @@ def _selftest():
     bpy.ops.object.modifier_apply(modifier="Subdivision")
     rock = bpy.context.active_object
     rmat = bpy.data.materials.new("rock")
-    rmat.use_nodes = True
+    ensure_node_tree(rmat)
     rock.data.materials.append(rmat)
 
     ground.select_set(True)
@@ -1212,7 +1664,10 @@ def _selftest():
     assert mix and mix.type == "MIX_SHADER", sorted(n.name for n in tree.nodes)
     out = next(n for n in tree.nodes if n.type == "OUTPUT_MATERIAL")
     assert out.inputs["Surface"].links[0].from_node.name == mix.name
-    fac = mix.inputs[0].links[0].from_node
+    # the factor runs Attribute('blend') -> edge breakup -> mix
+    brk = mix.inputs[0].links[0].from_node
+    assert brk == breakup_node(rock.active_material) and brk.node_tree == breakup_group(), brk.type
+    fac = brk.inputs["Blend"].links[0].from_node
     assert fac.type == "ATTRIBUTE" and fac.attribute_name == ATTR, fac.type
     # input 2 is the copied target shader, and its red base color came across
     tgt_bsdf = mix.inputs[2].links[0].from_node

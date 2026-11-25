@@ -30,7 +30,7 @@ class TextureTests(unittest.TestCase):
         obj = bpy.context.object
         obj.name = name
         mat = bpy.data.materials.new(name)
-        mat.use_nodes = True
+        cb.ensure_node_tree(mat)
         obj.data.materials.append(mat)
         return obj
 
@@ -267,6 +267,68 @@ class TextureTests(unittest.TestCase):
                     self.assertGreater(max(reference[0::4]) - min(reference[0::4]), 0.2,
                                        "Reference must contain a visible pattern")
                     self.assertEqual(bpy.ops.object.contact_blend_remove(), {"FINISHED"})
+
+    def test_breakup_is_identity_by_default_and_never_moves_the_ends(self):
+        """Render the breakup group's output straight to emission, compared to its input."""
+        tree = self.source.active_material.node_tree
+        tree.nodes.clear()
+        emission = tree.nodes.new("ShaderNodeEmission")
+        output = tree.nodes.new("ShaderNodeOutputMaterial")
+        tree.links.new(emission.outputs[0], output.inputs["Surface"])
+        value = tree.nodes.new("ShaderNodeValue")
+        breakup = tree.nodes.new("ShaderNodeGroup")
+        breakup.node_tree = cb.breakup_group()
+        names = emission.name, value.name, breakup.name
+        self.source.scale = (3, 3, 1)
+        self.target.hide_render = True
+        bpy.ops.object.camera_add(location=(0.2, 0.3, 3))
+        scene = bpy.context.scene
+        scene.camera = bpy.context.object
+        scene.camera.data.type = "ORTHO"
+        scene.camera.data.ortho_scale = 2
+        scene.render.engine = "CYCLES"
+        scene.cycles.device = "CPU"
+        scene.cycles.samples = 1
+        scene.cycles.use_denoising = False
+        scene.render.resolution_x = scene.render.resolution_y = 24
+        scene.render.resolution_percentage = 100
+        scene.view_settings.view_transform = "Standard"
+        scene.render.image_settings.file_format = "OPEN_EXR"
+        scene.render.image_settings.color_depth = "32"
+
+        def render(path, blend, through_breakup, **settings):
+            emission, value, breakup = (tree.nodes[n] for n in names)
+            value.outputs[0].default_value = blend
+            for key, v in settings.items():
+                breakup.inputs[key].default_value = v
+            if through_breakup:
+                tree.links.new(value.outputs[0], breakup.inputs["Blend"])
+                tree.links.new(breakup.outputs["Blend"], emission.inputs["Color"])
+            else:
+                tree.links.new(value.outputs[0], emission.inputs["Color"])
+            scene.render.filepath = str(path)
+            bpy.ops.render.render(write_still=True)
+            image = bpy.data.images.load(str(path), check_existing=False)
+            pixels = list(image.pixels)[0::4]
+            bpy.data.images.remove(image)
+            return pixels
+
+        defaults = {"Breakup": 0.0, "Sharpness": 0.0, "Noise Scale": 5.0}
+        strong = {"Breakup": 1.0, "Sharpness": 1.0, "Noise Scale": 30.0}
+        with tempfile.TemporaryDirectory(prefix="contact-blend-breakup-") as tmp:
+            out = pathlib.Path(tmp)
+            for blend in (0.0, 0.137, 0.5, 0.91, 1.0):
+                with self.subTest(blend=blend):
+                    direct = render(out / "direct.exr", blend, False)
+                    self.assertAlmostEqual(direct[0], blend, places=5)
+                    via = render(out / "via.exr", blend, True, **defaults)
+                    self.assertEqual(via, direct, "default breakup is not the identity")
+            for blend in (0.0, 1.0):
+                with self.subTest(blend=blend, settings="strong"):
+                    via = render(out / "strong.exr", blend, True, **strong)
+                    self.assertEqual(set(via), {blend}, "breakup moved an end of the ramp")
+            broken = render(out / "broken.exr", 0.5, True, **strong)
+            self.assertGreater(max(broken) - min(broken), 0.5, "breakup does nothing mid-ramp")
 
 
 if __name__ == "__main__":
