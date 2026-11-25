@@ -18,6 +18,7 @@ import argparse
 import json
 import math
 import pathlib
+import re
 import sys
 import time
 import urllib.request
@@ -102,7 +103,13 @@ def write_credits():
              "released under [CC0](https://creativecommons.org/publicdomain/zero/1.0/) (public "
              "domain); credit is not required, but given here gladly.", "",
              "| Asset | Type | Author(s) | Page |", "|---|---|---|---|"]
-    for asset, kind in sorted(USED.items()):
+    # a single-scene run must not drop the other scenes' assets from the list
+    credits = HERE / "CREDITS.md"
+    used = {asset: kind for kind, asset in re.findall(
+        r"\| (\w+) \| [^|]* \| https://polyhaven.com/a/(\w+) \|",
+        credits.read_text())} if credits.exists() else {}
+    used.update(USED)
+    for asset, kind in sorted(used.items()):
         info = api(f"info/{asset}")
         authors = ", ".join(sorted(info.get("authors", {})))
         lines.append(f"| {info.get('name', asset)} | {kind} | {authors} | "
@@ -150,8 +157,10 @@ def ground_material(name, maps, tile, variation=True):
     """A ground shader with its maps at real-world scale and the tiling broken up.
 
     The same texture repeating every couple of metres is the first thing that gives a ground
-    away. A second lookup, rotated and offset, is blended in by low-frequency noise, so no two
-    tiles in frame look alike.
+    away. Low-frequency noise varies its brightness and roughness, so no two tiles in frame look
+    alike. Only those: a second, rotated lookup of the maps (tried first) disagrees with the
+    relief the Displace modifier builds from the height map, and a rotated normal map lights
+    every bump from the wrong side -- the ground read as brushed metal.
     """
     mat = bpy.data.materials.new(name)
     tree = mat.node_tree
@@ -164,44 +173,40 @@ def ground_material(name, maps, tile, variation=True):
     a = tree.nodes.new("ShaderNodeMapping")
     a.inputs["Scale"].default_value = (1 / tile, 1 / tile, 1)
     tree.links.new(uv.outputs["UV"], a.inputs["Vector"])
-    vectors = [a.outputs["Vector"]]
-    mask = None
+
+    def sampled(path, colour):
+        node = tree.nodes.new("ShaderNodeTexImage")
+        node.image = _image(path, colour)
+        tree.links.new(a.outputs["Vector"], node.inputs["Vector"])
+        return node.outputs["Color"]
+
+    colour = sampled(maps["diff"], True)
+    rough = sampled(maps["rough"], False) if "rough" in maps else None
     if variation:
-        b = tree.nodes.new("ShaderNodeMapping")
-        b.inputs["Location"].default_value = (0.37, 0.71, 0)
-        b.inputs["Rotation"].default_value = (0, 0, math.radians(57))
-        b.inputs["Scale"].default_value = (0.83 / tile, 0.83 / tile, 1)
-        tree.links.new(uv.outputs["UV"], b.inputs["Vector"])
-        vectors.append(b.outputs["Vector"])
         noise = tree.nodes.new("ShaderNodeTexNoise")
-        noise.inputs["Scale"].default_value = 0.35
-        noise.inputs["Detail"].default_value = 3
+        noise.inputs["Scale"].default_value = 0.25          # patches of a few metres
+        noise.inputs["Detail"].default_value = 4
         tree.links.new(uv.outputs["UV"], noise.inputs["Vector"])
-        ramp = tree.nodes.new("ShaderNodeMapRange")
-        ramp.inputs[1].default_value = 0.42
-        ramp.inputs[2].default_value = 0.58
-        tree.links.new(noise.outputs["Fac"], ramp.inputs[0])
-        mask = ramp.outputs[0]
-
-    def sampled(path, colour, kind="RGBA"):
-        lookups = []
-        for v in vectors:
-            node = tree.nodes.new("ShaderNodeTexImage")
-            node.image = _image(path, colour)
-            tree.links.new(v, node.inputs["Vector"])
-            lookups.append(node.outputs["Color"])
-        if mask is None:
-            return lookups[0]
-        mix = tree.nodes.new("ShaderNodeMix")
-        mix.data_type = "RGBA"
-        tree.links.new(mask, mix.inputs["Factor"])
-        tree.links.new(lookups[0], mix.inputs[6])
-        tree.links.new(lookups[1], mix.inputs[7])
-        return mix.outputs[2]
-
-    tree.links.new(sampled(maps["diff"], True), bsdf.inputs["Base Color"])
-    if "rough" in maps:
-        tree.links.new(sampled(maps["rough"], False), bsdf.inputs["Roughness"])
+        shade = tree.nodes.new("ShaderNodeMapRange")       # 0.8x .. 1.15x brightness
+        shade.inputs[1].default_value, shade.inputs[2].default_value = 0.3, 0.7
+        shade.inputs[3].default_value, shade.inputs[4].default_value = 0.8, 1.15
+        tree.links.new(noise.outputs["Fac"], shade.inputs[0])
+        mul = tree.nodes.new("ShaderNodeMix")
+        mul.data_type, mul.blend_type = "RGBA", "MULTIPLY"
+        mul.inputs["Factor"].default_value = 1.0
+        tree.links.new(colour, mul.inputs[6])
+        tree.links.new(shade.outputs[0], mul.inputs[7])
+        colour = mul.outputs[2]
+        if rough is not None:                              # darker, damper patches are glossier
+            wet = tree.nodes.new("ShaderNodeMath")
+            wet.operation = "MULTIPLY_ADD"
+            tree.links.new(rough, wet.inputs[0])
+            tree.links.new(shade.outputs[0], wet.inputs[1])
+            wet.inputs[2].default_value = 0.0
+            rough = wet.outputs[0]
+    tree.links.new(colour, bsdf.inputs["Base Color"])
+    if rough is not None:
+        tree.links.new(rough, bsdf.inputs["Roughness"])
     if "nor" in maps:
         nmap = tree.nodes.new("ShaderNodeNormalMap")
         tree.links.new(sampled(maps["nor"], False), nmap.inputs["Color"])
@@ -243,6 +248,44 @@ def ground(name, size, cells, maps, tile, height, material=None):
     obj.data.uv_layers["UVMap"].active_render = True
     bpy.ops.object.shade_smooth()
     obj.data.materials.append(material)
+    return obj
+
+
+def apron(floor, size, cell, maps, tile, height):
+    """The same ground continued, coarse, out to `size` metres around `floor`, so a camera that
+    sees the horizon sees ground meet the sky's own horizon and not the edge of a tile.
+
+    A grid with a hole one cell smaller than `floor`, its UVs and Displace matching `floor`'s
+    exactly so the two surfaces agree at the seam; it sits 1 cm low so `floor` wins where they
+    overlap. It is not the blend's ground: nothing out there touches an object.
+    """
+    import bmesh
+    inner = floor.dimensions.x
+    n = int(size / cell)
+    bpy.ops.mesh.primitive_grid_add(size=size, x_subdivisions=n, y_subdivisions=n,
+                                    location=(floor.location.x, floor.location.y, -0.01))
+    obj = bpy.context.object
+    obj.name = floor.name + " apron"
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    half = inner / 2 - cell
+    bmesh.ops.delete(bm, geom=[f for f in bm.faces
+                               if max(abs(c) for c in f.calc_center_median()[:2]) < half],
+                     context="FACES")
+    uv, disp_uv = bm.loops.layers.uv["UVMap"], bm.loops.layers.uv.new("DispUV")
+    for f in bm.faces:
+        for loop in f.loops:
+            co = loop.vert.co
+            loop[uv].uv = (co.x + inner / 2, co.y + inner / 2)       # floor's UVs, in metres
+            loop[disp_uv].uv = ((co.x + inner / 2) / tile, (co.y + inner / 2) / tile)
+    bm.to_mesh(obj.data)
+    bm.free()
+    disp = obj.modifiers.new("Height", "DISPLACE")
+    disp.texture = floor.modifiers["Height"].texture
+    disp.texture_coords, disp.uv_layer = "UV", "DispUV"
+    disp.strength, disp.mid_level = height, 0.5
+    bpy.ops.object.shade_smooth()
+    obj.data.materials.append(floor.active_material)
     return obj
 
 
@@ -382,8 +425,12 @@ def render_settings(scene, samples, exposure=0.0, preview=False):
     scene.render.image_settings.quality = 92
 
 
-def render(scene, cam, path):
+def render(scene, cam, path, size=(1920, 1080), samples=None, preview=False):
     scene.camera = cam
+    if not preview:
+        scene.render.resolution_x, scene.render.resolution_y = size
+        if samples:
+            scene.cycles.samples = samples
     scene.render.filepath = str(path)
     t0 = time.time()
     bpy.ops.render.render(write_still=True)
@@ -428,11 +475,12 @@ def forest(args):
     rocks = append_objects(model("rock_moss_set_01"), names=("rock02", "rock03"))
     big, small = sorted(rocks, key=lambda o: -o.dimensions.length)
     big.name, small.name = "Mossy boulder", "Mossy rock"
-    place(big, (0.0, 0.0, 0.0), (0, 0, 35), sink=0.22)
+    place(big, (0.0, 0.0, 0.0), (0, 0, 35), sink=0.32)    # its scanned underside is smeared
     place(small, (2.55, 1.4, 0.0), (0, 0, -60), sink=0.28)
+    # Looking down at the forest floor, as one photographs it: no horizon, so no tile edge.
     return floor, [big, small], {"cams": [
-        ("hero", (6.2, -6.0, 1.75), (1.0, 0.5, 0.45), 40, 8),
-        ("compare", (3.7, -2.4, 0.75), (1.7, 0.75, 0.2), 70, 11)]}
+        ("hero", (3.9, -3.2, 3.3), (1.15, 0.55, 0.15), 40, 8),
+        ("compare", (3.1, -2.6, 1.9), (2.4, 0.55, 0.1), 50, 11)]}
 
 
 @scene
@@ -456,9 +504,12 @@ def boulders(args):
     for i, (asset, xy, heading, sink) in enumerate(layout):
         obj = append_objects(model(asset), rename=f"Boulder {i + 1}")[0]
         rocks.append(place(obj, (xy[0], xy[1], 0.0), (0, 0, heading), sink=sink))
+    apron(floor, 240, 0.25, maps, tile, height=0.06)
     return floor, rocks, {"cams": [
-        ("hero", (7.5, -9.0, 1.9), (0.0, 0.2, 0.5), 35, 11),
-        ("compare", (3.6, -3.4, 0.7), (1.4, -0.3, 0.25), 60, 11)]}
+        # From a rise, pitched down: the plain below the camera never meets the photographed
+        # horizon of the sky, which no flat ground can match.
+        ("hero", (5.5, -7.1, 4.5), (0.0, 0.0, 0.3), 35, 11),
+        ("compare", (-0.1, -4.7, 1.7), (-0.1, -1.3, 0.2), 40, 11)]}
 
 
 @scene
@@ -481,10 +532,23 @@ def macro(args):
 TUNING = {
     # Applied after the operator's fitted distances, as an artist would after a first look.
     # "objects" are each object's own settings; "ground" lives on the shared ground.
-    "forest": dict(objects={}, ground={"Contact Subdivisions": 2}, breakup=(0.55, 0.35, 6.0)),
-    "boulders": dict(objects={}, ground={"Contact Subdivisions": 2}, breakup=(0.5, 0.3, 4.0)),
+    # The fitted distances (a third of each rock's height, ~0.4 m) are right for a clean
+    # model; on these low-poly scans a band that wide shows the conformed ground sliding and
+    # its texture stretching. An artist pulls them in after a first look: the ground rises
+    # 0.25 m around the rock and only a hand's width of soil colour climbs onto it.
+    "forest": dict(objects={"Contact Distance": 0.25, "Material Blend Distance": 0.05,
+                            "Normal Blend Distance": 0.08},
+                   ground={"Contact Subdivisions": 2}, breakup=(0.6, 0.5, 6.0)),
+    # Same story on hard desert ground: the fitted 0.3-0.6 m bands smear sand halfway up the
+    # big boulders. 0.25 m keeps the front pair's bands overlapping.
+    "boulders": dict(objects={"Contact Distance": 0.25, "Material Blend Distance": 0.05,
+                              "Normal Blend Distance": 0.08},
+                     ground={"Contact Subdivisions": 2}, breakup=(0.6, 0.5, 4.0)),
+    # Normal Blend only at the contact line: at this scale the scan's ~3 mm facets are as big
+    # as the band, and in hard sun the welded (lit-looking) normals on faces the stone itself
+    # shadows rendered as dark triangular shards along the junction.
     "macro": dict(objects={"Contact Distance": 0.012, "Material Blend Distance": 0.006,
-                           "Normal Blend Distance": 0.006},
+                           "Normal Blend Distance": 0.0005},
                   ground={"Contact Subdivisions": 2, "Ground Detail": 0.0015, "Detail Midlevel": 0.5,
                           "Detail UV Map": "DispUV", "Detail Image": ("sand_01", "disp")},
                   breakup=(0.6, 0.4, 60.0)),
@@ -502,7 +566,7 @@ def build(name, args):
     RENDERS.mkdir(parents=True, exist_ok=True)
     suffix = "_preview" if args.preview else ""
     if not args.no_render:
-        render(scene, cams["compare"], RENDERS / f"{name}_before{suffix}.jpg")
+        render(scene, cams["compare"], RENDERS / f"{name}_before{suffix}.jpg", (1280, 720), 64, args.preview)
     proxy = blend_into(floor, rocks)
     tuning = TUNING[name]
     for rock in rocks:
@@ -523,8 +587,8 @@ def build(name, args):
     print(f"saved {blend_path.name}: {blend_path.stat().st_size / 1e6:.1f} MB", flush=True)
     if not args.no_render:
         after = RENDERS / f"{name}_after{suffix}.jpg"
-        render(scene, cams["compare"], after)
-        render(scene, cams["hero"], RENDERS / f"{name}_hero{suffix}.jpg")
+        render(scene, cams["compare"], after, (1280, 720), 64, args.preview)
+        render(scene, cams["hero"], RENDERS / f"{name}_hero{suffix}.jpg", (1920, 1080), args.samples, args.preview)
         composite(RENDERS / f"{name}_before{suffix}.jpg", after, RENDERS / f"{name}_compare{suffix}.jpg")
 
 
@@ -534,7 +598,7 @@ def main():
     parser.add_argument("--scene", choices=sorted(SCENES), action="append")
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--preview", action="store_true")
-    parser.add_argument("--samples", type=int, default=256)
+    parser.add_argument("--samples", type=int, default=96, help="hero image samples")
     args = parser.parse_args(argv)
     cb.register()
     try:

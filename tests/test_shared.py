@@ -404,11 +404,7 @@ class OverlapTests(SharedBase):
 
 
 class RoughObjectTests(SharedBase):
-    def test_ground_does_not_crumple_against_a_rough_scan(self):
-        """A rock that is rough at small scale -- as every photoscan is. Conforming to its exact
-        surface sent neighbouring ground vertices into different crevices and crumpled the
-        ground into shards with gaps at the junction; Contact Smoothing must prevent that."""
-        from mathutils.bvhtree import BVHTree
+    def rough_rock(self, smooth=False):
         # a ground fine enough (1 cm, 2.5 mm subdivided) to follow centimetre-scale roughness
         bpy.data.objects.remove(self.ground)
         self.ground = grid("Ground", 2, 200)
@@ -422,7 +418,64 @@ class RoughObjectTests(SharedBase):
         rough.texture = noise
         rough.strength = 0.03
         bpy.ops.object.modifier_apply(modifier=rough.name)
+        if smooth:
+            bpy.ops.object.shade_smooth()
         self.material(rock, "Rock")
+        return rock
+
+    def test_ground_texture_does_not_shred_up_a_rough_scan(self):
+        """Up a rough flank the ground's UVs are unfolded along the object's normal; a scan's
+        normal swings from vertex to vertex, and unfolding along it threw neighbouring corners'
+        UVs far apart -- radial streaks of shredded ground texture up a scanned boulder (the
+        forest demo). Above the ground, the UVs must change across each edge at about the
+        ground's own rate, not several times it. Smooth-shaded, as scans are: the normal is
+        blurred over face corners, which leaves a flat-shaded mesh's facets (and a box's sharp
+        edges) exactly as they are."""
+        import numpy as np
+        from mathutils.bvhtree import BVHTree
+        rock = self.rough_rock(smooth=True)
+        proxy = self.blend(rock)
+        mod = cb.find_mod(rock)
+        cb.set_socket(mod, "Material Blend Distance", 0.2)
+        proxy.update_tag()
+
+        def uv_rates():
+            gme, gco = self.ground_points()
+            gme.calc_loop_triangles()
+            ground = BVHTree.FromPolygons(gco, [t.vertices for t in gme.loop_triangles], all_triangles=True)
+            me = self.evaluated(rock)
+            uv = me.uv_layers[cb.TARGET_UV_ATTR].data
+            at = {}
+            for loop in me.loops:
+                at.setdefault(loop.vertex_index, uv[loop.index].uv.copy())
+            co = [rock.matrix_world @ v.co for v in me.vertices]
+            rates = []
+            for e in me.edges:
+                a, b = e.vertices
+                mid = (co[a] + co[b]) / 2
+                near, normal, _, dist = ground.find_nearest(mid)
+                if (mid - near).dot(normal) > 0 and 0.02 < dist < 0.15:      # up the flank
+                    rates.append((at[b] - at[a]).length / (co[b] - co[a]).length / 0.5)   # 2 m grid
+            self.assertGreater(len(rates), 500, "no flank above the ground; the test is not biting")
+            return np.percentile(rates, [50, 95])
+
+        median, p95 = uv_rates()
+        self.assertLess(median, 1.6, f"ground texture stretched up the flank: median {median:.2f}x")
+        self.assertLess(p95, 2.5, f"ground texture shredded up the flank: 95th percentile {p95:.2f}x")
+        # Contact Smoothing is the ground's setting; the shared ground hands it to every object
+        cb.set_socket(cb.ground_mod(proxy), "Contact Smoothing", 0)
+        proxy.update_tag()
+        bpy.context.view_layer.update()
+        self.assertEqual(cb.socket(mod, "Contact Smoothing"), 0)
+        unsmoothed = uv_rates()
+        self.assertGreater(unsmoothed[1], 4.0, "the test is not biting: no shredding unsmoothed")
+
+    def test_ground_does_not_crumple_against_a_rough_scan(self):
+        """A rock that is rough at small scale -- as every photoscan is. Conforming to its exact
+        surface sent neighbouring ground vertices into different crevices and crumpled the
+        ground into shards with gaps at the junction; Contact Smoothing must prevent that."""
+        from mathutils.bvhtree import BVHTree
+        rock = self.rough_rock()
         proxy = self.blend(rock)
         surface = BVHTree.FromObject(rock, bpy.context.evaluated_depsgraph_get())
 
@@ -563,8 +616,18 @@ class LegacyTests(unittest.TestCase):
         self.assertEqual(len(me.vertices), len(old.vertices))
         worst = max((a.co - b.co).length for a, b in zip(me.vertices, old.vertices))
         self.assertLess(worst, 1e-6, "the upgraded joined blend moved geometry")
-        worst = max((a.vector - b.vector).length for a, b in zip(me.corner_normals, old.corner_normals))
-        self.assertLess(worst, 1e-5, "the upgraded joined blend changed shading normals")
+        # Shading normals changed deliberately in 2.0: the weld used to mix the object's normal
+        # linearly with the ground's, which collapsed to near-zero vectors (black wedges) where
+        # the two point apart. Away from the weld nothing may change; within it every normal
+        # must now be a proper unit vector.
+        own = [n.vector.normalized() for n in rock.data.corner_normals]
+        unwelded = 0
+        for i, (new, before) in enumerate(zip(me.corner_normals[:len(own)], old.corner_normals)):
+            self.assertAlmostEqual(new.vector.length, 1.0, delta=1e-4)
+            if (before.vector - own[i]).length < 1e-6:
+                unwelded += 1
+                self.assertLess((new.vector - own[i]).length, 1e-5, "an unwelded normal changed")
+        self.assertGreater(unwelded, 100)
         # `blend` deliberately changed in 2.0: it is measured against the conformed ground the
         # object meets rather than the flat original, so it reaches 1 at the visible junction
         # on the meniscus. Check the new definition exactly: smoothstep falloff over Material

@@ -14,6 +14,43 @@ objects can sit on one ground: they all crater the same surface.
 | **Location** | `View3D > Sidebar (N) > Contact`, and `Object > Contact Blend` |
 | **Renderers** | EEVEE Next and Cycles |
 
+## Demo
+
+Three scenes built from real scanned [Poly Haven](https://polyhaven.com) assets (CC0, see
+[demo/CREDITS.md](demo/CREDITS.md)), each blended with the add-on's own operators exactly as an
+artist would: pick the ground, select the objects, press **Contact Blend**, then adjust a few
+settings. Left half without the add-on, right half with it, from the same camera:
+
+**Forest floor:** two mossy boulders settled into soil and needles.
+
+![Forest floor, before and after](demo/renders/forest_compare.jpg)
+
+**Boulders:** five granite boulders of very different sizes on dry, stony ground; the two at the
+front overlap each other's contact bands.
+
+![Boulders, before and after](demo/renders/boulders_compare.jpg)
+
+**Macro:** a 15 cm stone half-buried in sand, with Edge Breakup and Ground Detail.
+
+![Macro, before and after](demo/renders/macro_compare.jpg)
+
+Full-size renders are in [demo/renders](demo/renders) (`<scene>_hero.jpg`, `<scene>_before.jpg`,
+`<scene>_after.jpg`). To rebuild them, run the script with Blender 5.x (or a `bpy` wheel). It
+downloads the assets into `demo/assets/` (git-ignored), builds each scene, saves
+`demo/<scene>.blend` with its textures packed, and renders:
+
+```bash
+blender -b -P demo/build_demos.py                       # all three scenes, full quality
+blender -b -P demo/build_demos.py -- --scene macro      # one scene
+blender -b -P demo/build_demos.py -- --no-render        # build and save the .blend files only
+blender -b -P demo/build_demos.py -- --preview          # quick 640x360 renders, *_preview.jpg
+```
+
+Rendering is Cycles on the CPU. A full run takes a long time on a laptop; `--samples N` sets the
+hero image's samples (default 96). With textures packed, `demo/forest.blend` and
+`demo/macro.blend` are about 35 and 40 MB; `demo/boulders.blend` (five full-resolution scans) is
+about 130 MB and git-ignored, so build it with `-- --scene boulders --no-render`.
+
 ## Install
 
 1. Download `contact_blend.py`.
@@ -109,7 +146,7 @@ effect immediately: the ground appears or disappears and the original is hidden 
   settings and your edits to the object's materials. It acts on every selected blended object (or
   every object on a selected ground).
 - **Fit Size** sets Contact Distance, the blend distances and Surface Offset from the object's
-  width. New blends get this automatically; Update and re-applying never overwrite your values.
+  size. New blends get this automatically; Update and re-applying never overwrite your values.
 - **Remove** removes the modifier and reconnects the object's shader, keeping the isolated material
   and your edits. Generated nodes are removed unless you have wired them into other parts of the
   shader. Original ground visibility is restored after the last blend on it is removed; visibility
@@ -164,7 +201,7 @@ its average).
 |---|---|---|
 | **Target** | — | The ground to sink into. |
 | **Displace Ground** | on | Conform the ground at all. Off means shading and material blending only; the ground is drawn unchanged. |
-| **Contact Distance** | ⅓ of the object's width | Radius of the effect around this object; the ground is untouched beyond it. |
+| **Contact Distance** | ⅓ of the object's size | Radius of the effect around this object; the ground is untouched beyond it. |
 | **Ground Conform** | 1.0 | How far the ground moves onto the object. **At 0 the ground cannot move and there is no blend** — the sidebar warns about this. |
 | **Surface Offset** | 1.2% of Contact Distance | How far *inside* the object the ground lands, so it does not z-fight along the contact band (0.002 m for a 0.5 m object). |
 
@@ -183,13 +220,15 @@ its average).
 | Setting | Default | What it does |
 |---|---|---|
 | **Subdivisions** | 2 | Subdivides only the faces that can reach an object. Each level is 4× the faces there. |
+| **Smoothing** | 8 | How much the object's surface is smoothed before the ground is conformed to it, so the ground fills small crevices of a rough scan instead of crumpling into them, and how calm the direction is along which the ground's texture is continued up the object's flank, so it does not shred into streaks on a rough scan. 0 uses the exact surface. |
 | **Detail Height** | 0.0 m | Height of the contact-zone displacement. |
 | **Detail Image** | — | Height map for that displacement. |
 | **Detail UV Map** | `UVMap` | Which ground UV map to sample it through. |
 | **Detail Midlevel** | 0.0 | Value that means "no displacement". Set **0.5** for a real height map; the 0 default makes an unset image a no-op. |
 
-Contact Distance, Surface Offset and the blend distances are fitted to the object's width when a
-blend is created (⅓ of its smaller horizontal side, clamped to 1 mm–50 m), and **Fit Size** re-applies
+Contact Distance, Surface Offset and the blend distances are fitted to the object's size when a
+blend is created (⅓ of its smaller horizontal side or its height, whichever is less, clamped to
+1 mm–50 m, so a low boulder or a paving slab is not covered in ground colour to its top), and **Fit Size** re-applies
 that on demand.
 
 **Hazards.** The sidebar warns, with a one-click fix where there is one, when the original ground
@@ -268,8 +307,8 @@ blender --background --python-exit-code 1 --python tests/test_shared.py
 ```
 
 ```
-OK  hero_moved=0.000000  ground dip=-0.0715 far=0.000000 subdiv=1681->7621  detail=0.2619
-    blend=0.000..0.984  bent=576/1536  ground=7501
+OK  hero_moved=0.000000  ground dip=-0.0692 far=0.000000 subdiv=1681->7081  detail=0.2696
+    blend=0.000..0.984  bent=320/1536  ground=6601
 ```
 
 The self-test covers: the object's mesh is never deformed and carries only itself, flat shading
@@ -282,19 +321,24 @@ without losing settings, and a file saved under the 1.0 name migrates without or
 - `tests/test_workflow.py` — shared materials and linked meshes, repeated application and refresh,
   user shader edits, retargeting, per-view-layer visibility, legacy removal, save/reload, node-state
   fidelity of copied shaders, every material slot, edge breakup, appended/linked groups found by
-  stamp, grounds outside the view layer, and fitted distances.
+  stamp, grounds outside the view layer, and fitted distances (capped by the object's height).
 - `tests/test_textures.py` — transformed grounds, UV sampling after conforming (shared and joined),
   private shader groups, disabled matching, small CPU Cycles renders against the original ground
-  pattern, and the breakup node's identity and end-point guarantees.
+  pattern, the breakup node's identity and end-point guarantees, the ground colour reaching the
+  visible junction, and ground UVs keeping their scale up a vertical flank instead of streaking.
 - `tests/test_geometry.py` — coarse grounds, the crack-free cut, welding on curved grounds, Displace
-  Ground off, world-metre distances under object scale, and instanced grounds; every test runs on
-  both the shared ground and a legacy joined copy.
+  Ground off, world-metre distances under object scale, instanced grounds, `blend` measured against
+  the ground as drawn, and welded normals that never collapse; every test runs on both the shared
+  ground and a legacy joined copy.
 - `tests/test_shared.py` — two and five objects on one ground, per-object Contact Distance, a
   moving/scaled/rotated ground, removal, duplication, a deleted shared ground, ground settings,
   save/reload, multi-selection, how the selection is resolved, the panel in every state (drawn with
-  a recording layout, since there is no UI headless), the Diagnose report, and a 1.x joined blend
-  (`tests/fixtures/joined_v7.blend`, written by that release) evaluating the same and converting
-  cleanly.
+  a recording layout, since there is no UI headless), the Diagnose report, a 1.x joined blend
+  (`tests/fixtures/joined_v7.blend`, written by that release) upgrading and converting cleanly,
+  overlapping contact bands (same and very different sizes, touching, interpenetrating: no folds,
+  no slivers, continuous under a tiny move, exactly the single-object result when bands do not
+  meet), regrouping on a move, and a rough scan-like rock that must neither crumple the ground nor shred
+  the ground's texture continued up its flank.
 
 For a headless environment with the official `bpy` package installed, the same checks run directly
 with that Python interpreter:

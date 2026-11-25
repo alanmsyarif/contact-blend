@@ -584,6 +584,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(bpy.ops.object.contact_blend_fit(), {"FINISHED"})
         self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), 1.0, places=5)
 
+    def test_fit_is_capped_by_the_object_height(self):
+        # a 1 m x 1 m paving slab 6 cm thick: a third of its width (0.33 m) is five times its
+        # height and blended ground colour over its whole top; a third of its height does not.
+        # Found on a scanned 2.6 x 3.3 x 1.1 m boulder, where the width gave 0.8 m of blend.
+        bpy.ops.mesh.primitive_cube_add(size=1, location=(5, 5, 0.03))
+        slab = bpy.context.object
+        slab.scale = (1, 1, 0.06)
+        bpy.context.view_layer.update()
+        slab.data.materials.append(self.source.active_material)
+        mod = self.apply(slab)
+        self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), 0.02, places=5)
+        self.assertAlmostEqual(cb.socket(mod, "Material Blend Distance"), 0.02, places=5)
+        self.assertAlmostEqual(cb.socket(mod, "Normal Blend Distance"), 0.02 * 2 / 3, places=5)
+        self.assertAlmostEqual(cb.socket(mod, "Surface Offset"), 0.02 * 0.012, places=6)
+
     def test_user_distances_survive_reapply_and_update_until_fit(self):
         obj, mod, ids = self.fitted(0.5)
         cb.set_socket(mod, "Contact Distance", 0.9)

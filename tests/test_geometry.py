@@ -241,6 +241,8 @@ class GeometryTests(unittest.TestCase):
                 z = (rock.matrix_world @ me.vertices[me.loops[i].vertex_index].co).z
                 x = min(abs(z) / reach, 1.0)
                 t = 1 - x * x * (3 - 2 * x)
+                # the weld fades out for faces turned away from the ground (see _build_group)
+                t *= min(max(own[poly.index, i].dot(Vector((0, 0, 1))) + 1, 0.0), 1.0)
                 expected = (own[poly.index, i] * (1 - t) + Vector((0, 0, 1)) * t).normalized()
                 got = me.corner_normals[i].vector.normalized()
                 self.assertLess((got - expected).length, 1e-3,
@@ -365,6 +367,20 @@ class GeometryTests(unittest.TestCase):
             far += d > reach
         self.assertGreater(touching, 10, "no vertex touches the ground; the test is not biting")
         self.assertGreater(far, 10)
+
+    def test_welded_normals_never_collapse(self):
+        # The underside of a sunk sphere faces down while the ground's normal faces up; a linear
+        # mix of the two came out nearly zero there and rendered as black wedges at the junction.
+        ground = grid("Ground", 4, 80)
+        self.material(ground, "Ground")
+        rock = self.sphere((0.03, 0.02, 0.1), radius=0.4)
+        mod, ids = self.apply(rock, ground)
+        cb.set_socket(mod, "Normal Blend Distance", 0.3)
+        rock.update_tag()
+        me = self.evaluated(rock)
+        own = len(rock.data.loops)
+        lengths = [n.vector.length for n in list(me.corner_normals)[:own]]
+        self.assertGreater(min(lengths), 0.999, f"collapsed welded normal: {min(lengths):.3f}")
 
     def test_instanced_target_is_realized(self):
         ground = grid("Ground", 4, 40)

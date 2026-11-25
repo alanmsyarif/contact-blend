@@ -26,7 +26,7 @@ LEGACY_NAMES = ("Blend To Surface",)
 # number, so an existing .blend picks up fixes on reload instead of silently running the tree
 # it was first built with -- a stale group is indistinguishable from a bug that did not get
 # fixed, and telling people to delete it by hand is exactly how it survives.
-GROUP_VERSION = 13
+GROUP_VERSION = 16
 # The stamp moved with the rename. An old group carries the value under the old key, so read
 # both and rewrite to the current one -- treating the old key as unstamped would force a
 # needless rebuild, and the diagnostic would report a group of unknown vintage.
@@ -839,39 +839,54 @@ def _build_group(ng):
     link(g["Target UV Map"], target_uv.inputs["Name"])
     mapped_src = t.node("GeometryNodeStoreNamedAttribute", 3200, -1700, data_type="FLOAT2", domain="CORNER")
     mapped_src.inputs["Name"].default_value = TARGET_UV_ATTR
-    link(src, mapped_src.inputs["Geometry"])
-    # Above the ground, nearest-point sampling alone smears the texture: every point up a steep
-    # flank finds the same rim of ground below it, so the ground's texture is stretched into
-    # vertical streaks wherever the material blend reaches up the object. Continue the ground's
-    # UVs across the flank instead, as if it were folded down flat: offset the lookup by the
-    # height h above the ground (along the ground normal n) times the horizontal part m of the
-    # object's own normal, and turn that into UVs through the raw target's own mapping,
-    #     uv = uv(q) + uv_raw(q + h m) - uv_raw(q).
-    # On a vertical wall |m| = 1, so the texture keeps its real-world scale; on faces lying
-    # flat m = 0 and nothing changes; at h = 0 this is exactly the nearest-point UV, so the
-    # junction stays continuous; buried points (h < 0) are left alone. Exact for planar ground
-    # UVs, which the difference of two raw lookups measures rather than assumes.
+    # The direction the flank is unfolded along comes from the object's normal, and a scanned
+    # rock's normal swings by tens of degrees from one vertex to the next. Times a height of
+    # ~0.1 m that throws neighbouring corners' UVs centimetres apart, and the ground's texture
+    # up the flank shreds into radial streaks. So with Contact Smoothing set, smooth-shaded
+    # faces (every scan) use the normal blurred over the object's points, 4x as many passes as
+    # the shape gets: the direction needs to be calm at a larger scale than the surface does.
+    # Flat-shaded faces keep their corner's own normal: a point's normal averages the faces
+    # around it, which would swing a box's wall 45 degrees at its edges. With 0, every corner
+    # keeps its own, exactly as before.
+    flank = t.node("GeometryNodeCaptureAttribute", 3000, -1650, domain="POINT")
+    flank.capture_items.new("VECTOR", "normal")
+    link(src, flank.inputs["Geometry"])
+    calm = t.node("GeometryNodeBlurAttribute", 2800, -1650, data_type="FLOAT_VECTOR")
+    link(t.nor, calm.inputs["Value"])
+    link(t.math(2600, -1650, "MULTIPLY", g["Contact Smoothing"], 4.0), calm.inputs["Iterations"])
+    link(calm.outputs["Value"], flank.inputs["normal"])
+    link(flank.outputs["Geometry"], mapped_src.inputs["Geometry"])
+    smooth_face = t.node("GeometryNodeInputShadeSmooth", 2800, -1500)
+    use_calm = t.math(2900, -1550, "MULTIPLY", smooth_face.outputs[0],
+                      t.math(2900, -1500, "GREATER_THAN", g["Contact Smoothing"], 0.0))
+    flank_n = t.switch(3000, -1550, use_calm,
+                       t.nor, t.vmath(3100, -1650, "NORMALIZE", flank.outputs["normal"]), kind="VECTOR")
+
     # The height and "up" come from v = p - q itself -- |v|, and v / |v| -- with the ground's
     # normal used only to tell above from buried: two nearest-surface searches can settle on
     # different faces at a crease of the conformed ground, and mixing one's point with the
     # other's normal would put a seam in the UVs along every crease.
     uv_attr = target_uv.outputs["Attribute"]
+
+    def raw_at(x, y, field, where, data_type="FLOAT_VECTOR"):
+        s_ = t.node("GeometryNodeSampleNearestSurface", x, y, data_type=data_type)
+        link(raw, s_.inputs["Mesh"])
+        link(field, s_.inputs["Value"])
+        link(where, s_.inputs["Sample Position"])
+        return s_.outputs["Value"]
+
     nearest = t.proximity(2600, -2000, shade_ref)[1]
     ground_n = t.sample(2600, -2100, shade_ref, t.true_nor)
     rise = t.vmath(2700, -2000, "SUBTRACT", t.pos, nearest)
     above = t.math(2800, -2100, "GREATER_THAN", t.vmath(2800, -2150, "DOT_PRODUCT", rise, ground_n), 0.0)
     height = t.math(2800, -2000, "MULTIPLY", t.vmath(2700, -2050, "LENGTH", rise), above)
     up = t.vmath(2600, -2250, "NORMALIZE", rise)
-    across = t.vmath(2800, -2200, "SUBTRACT", t.nor,
-                     t.vmath(2700, -2200, "SCALE", up, scale=t.vmath(2600, -2300, "DOT_PRODUCT", t.nor, up)))
+    across = t.vmath(2800, -2200, "SUBTRACT", flank_n,
+                     t.vmath(2700, -2200, "SCALE", up, scale=t.vmath(2600, -2300, "DOT_PRODUCT", flank_n, up)))
     unfolded = t.vmath(2900, -2200, "ADD", nearest, t.vmath(2900, -2300, "SCALE", across, scale=height))
 
     def raw_uv(x, y, where):
-        s_ = t.node("GeometryNodeSampleNearestSurface", x, y, data_type="FLOAT_VECTOR")
-        link(raw, s_.inputs["Mesh"])
-        link(uv_attr, s_.inputs["Value"])
-        link(where, s_.inputs["Sample Position"])
-        return s_.outputs["Value"]
+        return raw_at(x, y, uv_attr, where)
 
     shift = t.vmath(3000, -2200, "SUBTRACT", raw_uv(3000, -2300, unfolded), raw_uv(3000, -2400, nearest))
     link(t.vmath(3100, -2000, "ADD", t.sample(3100, -1900, shade_ref, uv_attr), shift), mapped_src.inputs["Value"])
@@ -903,10 +918,21 @@ def _build_group(ng):
     link(g["Shared Ground"], joined.inputs[1])
     out = t.switch(3400, 0, joined.outputs[0], shaded_src, join.outputs["Geometry"])
 
+    # A linear mix of two unit normals that point apart is shorter than either, and of two that
+    # point opposite ways -- the underside of a rock lip right above the ground -- it is nearly
+    # zero, which shades as black wedges along the junction. So the weld fades out as the
+    # object's normal turns away from the ground's: full strength for faces at or above
+    # perpendicular to it, none for faces pointing straight against it. The result is
+    # normalised. Away from the ground (weight 0) it is the object's own normal, untouched.
+    facing = t.math(3300, -900, "MINIMUM",
+                    t.math(3200, -900, "ADD", t.vmath(3100, -900, "DOT_PRODUCT", t.nor, weld_n.outputs["normal"]), 1.0),
+                    1.0)
+    facing = t.math(3350, -900, "MAXIMUM", facing, 0.0)
     mix = t.node("ShaderNodeMix", 3400, -1000, data_type="VECTOR")
-    link(weld_n.outputs["weight"], mix.inputs[0])
+    link(t.math(3400, -900, "MULTIPLY", weld_n.outputs["weight"], facing), mix.inputs[0])
     link(t.nor, mix.inputs[4])
     link(weld_n.outputs["normal"], mix.inputs[5])
+    welded = t.vmath(3500, -1000, "NORMALIZE", mix.outputs[1])
 
     # CORNER, not POINT: `FREE` mode has no selection input, so the custom normal is
     # written mesh-wide. On POINT that replaces every corner normal with the averaged
@@ -914,7 +940,7 @@ def _build_group(ng):
     # existing corner normal, so far from the target the write is a no-op.
     sn = t.node("GeometryNodeSetMeshNormal", 3500, 0, mode="FREE", domain="CORNER")
     link(out, sn.inputs["Mesh"])
-    link(mix.outputs[1], sn.inputs["Custom Normal"])
+    link(welded, sn.inputs["Custom Normal"])
     link(sn.outputs["Mesh"], gout.inputs[0])
     return ng
 
@@ -1744,11 +1770,14 @@ def target_displaces(mod):
 
 
 def object_width(obj):
-    """Smaller horizontal (world X/Y) extent of `obj`'s own mesh, in metres, or None.
+    """Smallest of the horizontal (world X/Y) extents and the height of `obj`'s own mesh, in
+    metres, or None.
 
     Measured from the mesh data, not the evaluated object: once the blend exists the evaluated
-    mesh has the whole ground joined into it. The smaller side, so a long log or a thin wall
-    gets a contact band sized to its thickness rather than to its length.
+    mesh has the whole ground joined into it. The smaller horizontal side, so a long log or a
+    thin wall gets a contact band sized to its thickness rather than to its length; and never
+    more than the height, so a low boulder or a paving slab is not buried in ground colour
+    up to its top (a 2.6 m wide, 1.1 m high scanned boulder got 0.8 m of blend from its width).
     """
     import numpy as np
     if obj.type != "MESH" or not obj.data.vertices:
@@ -1758,17 +1787,17 @@ def object_width(obj):
     m = np.array(obj.matrix_world, dtype=np.float64)
     world = co.reshape(-1, 3) @ m[:3, :3].T + m[:3, 3]
     extent = world.max(axis=0) - world.min(axis=0)
-    return float(min(extent[0], extent[1]))
+    return float(min(extent[0], extent[1], extent[2]))
 
 
 def fit_to_object(mod, obj):
     """Size the distance settings to `obj`, so a pebble and a boulder both start sensibly.
 
     A fixed 0.3 m Contact Distance swallows a 5 cm pebble whole and is invisible under a 20 m
-    boulder. Contact Distance ~1/3 of the width matches the advice that always went with it;
-    the rest follow in proportion (Surface Offset lands on the old 0.002 m for a ~0.5 m
-    object). Only ever called on a new blend or on explicit request: on Update or a re-apply
-    these are the user's values.
+    boulder. Contact Distance ~1/3 of the object's smallest extent (see `object_width`) matches
+    the advice that always went with it; the rest follow in proportion (Surface Offset lands on
+    the old 0.002 m for a ~0.5 m object). Only ever called on a new blend or on explicit
+    request: on Update or a re-apply these are the user's values.
     """
     width = object_width(obj)
     if not width:
