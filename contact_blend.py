@@ -15,6 +15,8 @@ import bpy
 
 GROUP = "Contact Blend"
 ATTR = "blend"
+# How far each point of the object sits in a crevice (> 0.5) or on a ridge (< 0.5); see _build_group.
+CAVITY_ATTR = "cb_cavity"
 # Names this add-on shipped under before 1.1. Both the node group and the material mix node are
 # found by *name*, so renaming without a migration would orphan every .blend built with an
 # older release: the modifier would keep evaluating, but the panel could not find it and
@@ -26,7 +28,7 @@ LEGACY_NAMES = ("Blend To Surface",)
 # number, so an existing .blend picks up fixes on reload instead of silently running the tree
 # it was first built with -- a stale group is indistinguishable from a bug that did not get
 # fixed, and telling people to delete it by hand is exactly how it survives.
-GROUP_VERSION = 16
+GROUP_VERSION = 17
 # The stamp moved with the rename. An old group carries the value under the old key, so read
 # both and rewrite to the current one -- treating the old key as unstamped would force a
 # needless rebuild, and the diagnostic would report a group of unknown vintage.
@@ -50,10 +52,12 @@ GROUP_ATTR = "cb_group"
 REACH_KEY = "cb_ground_reach"
 # Contact Smoothing for new blends: Blur Attribute iterations on the surface the ground conforms to.
 SMOOTHING = 8
+# Blur passes that define the neighbourhood a crevice is measured against (cb_cavity).
+CAVITY_PASSES = 16
 PROXY_KEY = "cb_ground_proxy"
 HEROES_KEY = "cb_ground_objects"
 APPLIED_KEY = "cb_applied"
-BREAKUP_VERSION = 1
+BREAKUP_VERSION = 2
 
 
 def _socket(ng, name, stype, in_out="INPUT", **kw):
@@ -806,9 +810,30 @@ def _build_group(ng):
     # *conformed* ground, which has climbed its flank as a meniscus; measured against the flat
     # original, blend is already near 0 up there and the object stays its own colour right down
     # to the ground.
+    # --- 'cb_cavity': crevice (1) .. ridge (0), for the shader's Edge Breakup ---
+    # A real junction is a broken edge: soil lies in the crevices and low pockets of a rock and
+    # its ridges stand clear. How far each point sits below its neighbourhood -- the blurred
+    # surface minus the surface, along the normal -- says which is which. Measured in units of
+    # a tenth of Material Blend Distance, so it means the same on a pebble and on a boulder,
+    # and stored per point so EEVEE reads it as well as Cycles (Pointiness is Cycles-only).
+    cavity_blur = t.node("GeometryNodeBlurAttribute", 2600, 200, data_type="FLOAT_VECTOR")
+    link(t.pos, cavity_blur.inputs["Value"])
+    cavity_blur.inputs["Iterations"].default_value = CAVITY_PASSES
+    depth = t.vmath(2800, 200, "DOT_PRODUCT", t.vmath(2700, 200, "SUBTRACT", cavity_blur.outputs["Value"], t.pos),
+                    t.nor)
+    unit = t.math(2700, 300, "MAXIMUM", t.math(2600, 300, "MULTIPLY", material_dist, 0.1), 1e-7)
+    cavity = t.node("ShaderNodeMapRange", 2900, 200, clamp=True)
+    link(t.math(2850, 300, "DIVIDE", depth, unit), cavity.inputs[0])
+    cavity.inputs[1].default_value, cavity.inputs[2].default_value = -1.0, 1.0
+    cavity.inputs[3].default_value, cavity.inputs[4].default_value = 0.0, 1.0
+    cav_store = t.node("GeometryNodeStoreNamedAttribute", 3000, 100, data_type="FLOAT", domain="POINT")
+    cav_store.inputs["Name"].default_value = CAVITY_ATTR
+    link(hero, cav_store.inputs["Geometry"])
+    link(cavity.outputs[0], cav_store.inputs["Value"])
+
     store = t.node("GeometryNodeStoreNamedAttribute", 3200, 0, data_type="FLOAT", domain="POINT")
     store.inputs["Name"].default_value = ATTR
-    link(hero, store.inputs["Geometry"])
+    link(cav_store.outputs["Geometry"], store.inputs["Geometry"])
     link(t.ramp(3000, -700, d_ref, material_dist, 1.0, 0.0), store.inputs["Value"])
 
     # --- the settings the shared ground needs, carried on the geometry ---
@@ -902,8 +927,32 @@ def _build_group(ng):
     weld_n.capture_items.new("FLOAT", "weight")
     weld_n.capture_items.new("VECTOR", "normal")
     link(uv_src, weld_n.inputs["Geometry"])
-    link(t.ramp(3200, -1250, d_ref, normal_dist, 1.0, 0.0), weld_n.inputs["weight"])
-    link(t.sample(3000, -1400, shade_ref, t.nor), weld_n.inputs["normal"])
+    ground_nor = t.sample(3000, -1400, shade_ref, t.nor)
+    # Never bend a normal towards a direction the object itself blocks. Under an overhang or
+    # in a crevice the ground's normal points into the object's own rock; welded towards it,
+    # a face the object shadows shaded as lit right up to the edge of that shadow, and on a
+    # coarse scan in low sun the edge runs along the facets: hard dark shards all along the
+    # junction (the macro demo). So look along the ground's normal from each corner: the weld
+    # fades with how soon the object itself is in the way, over 4x Normal Blend Distance.
+    look = 4.0
+    reach_open = t.math(3000, -1500, "MAXIMUM", t.math(2950, -1500, "MULTIPLY", normal_dist, look), 1e-7)
+    ray = t.node("GeometryNodeRaycast", 3100, -1500)
+    link(hero, ray.inputs["Target Geometry"])
+    # Start a little off the surface along the object's own normal as well: a ray straight up
+    # a vertical wall otherwise grazes the wall and catches its own top rim.
+    lift = t.math(2900, -1600, "MULTIPLY", reach_open, 0.02)
+    link(t.vmath(3000, -1600, "ADD", t.pos,
+                 t.vmath(2950, -1600, "SCALE", t.vmath(2900, -1650, "ADD", ground_nor, t.nor), scale=lift)),
+         ray.inputs["Source Position"])
+    link(ground_nor, ray.inputs["Ray Direction"])
+    link(reach_open, ray.inputs["Ray Length"])
+    blocked = t.math(3200, -1550, "MULTIPLY", ray.outputs["Is Hit"],
+                     t.math(3150, -1550, "SUBTRACT", 1.0,
+                            t.math(3100, -1600, "DIVIDE", ray.outputs["Hit Distance"], reach_open)))
+    open_sky = t.math(3250, -1500, "SUBTRACT", 1.0, blocked)
+    link(t.math(3300, -1250, "MULTIPLY", t.ramp(3200, -1250, d_ref, normal_dist, 1.0, 0.0), open_sky),
+         weld_n.inputs["weight"])
+    link(ground_nor, weld_n.inputs["normal"])
     shaded_src = weld_n.outputs["Geometry"]
 
     # Object/Generated coordinates on joined ground otherwise use the hero's transform
@@ -1253,24 +1302,43 @@ def _material_mix(mat):
 
 
 def _build_breakup(ng):
-    """Edge breakup: roughen the linear `blend` ramp without moving its ends.
+    """Edge breakup: break the smooth `blend` ramp into the edge a real junction has, without
+    moving its ends.
 
-    The geometry hands the shader a smooth per-vertex ramp, which reads as an airbrushed band.
-    Push it around with noise, scaled by an envelope b*(1-b) that is exactly 0 at b=0 and b=1:
-    however strong the breakup, nothing speckles far from the contact (b=0) and nothing
-    punches holes where the object meets the ground (b=1). Sharpness then steepens the result
-    around 0.5. With Breakup and Sharpness at their default 0 every step reduces to the
-    identity exactly -- b + 0, then a map range from [0, 1] to [0, 1] -- so adding this node
-    to an existing material changes nothing until someone turns it up.
+    The geometry hands the shader a smooth per-vertex ramp, which reads as an airbrushed band
+    of stretched ground texture. Push it around with noise and with the object's own crevices
+    (`cb_cavity`: soil lies in the pockets, ridges stand clear), scaled by an envelope b*(1-b)
+    that is exactly 0 at b=0 and b=1: however strong the breakup, nothing speckles far from the
+    contact (b=0) and nothing punches holes where the object meets the ground (b=1). Sharpness
+    then steepens the result around 0.5, into a broken edge rather than a gradient. With
+    Breakup, Crevices and Sharpness at 0 every step reduces to the identity exactly -- b + 0,
+    then a map range from [0, 1] to [0, 1] -- so a material upgraded from an earlier release
+    changes nothing until someone turns them up. New blends get fitted values (fit_breakup).
 
     Noise is in Object space, so it is the hero's own coordinates: it does not swim when UVs
     change, and it moves with the object rather than with the camera.
     """
-    _socket(ng, "Blend", "NodeSocketFloat", "OUTPUT")
-    _socket(ng, "Blend", "NodeSocketFloat", default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")
-    _socket(ng, "Noise Scale", "NodeSocketFloat", default_value=5.0, min_value=0.0)
-    _socket(ng, "Breakup", "NodeSocketFloat", default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")
-    _socket(ng, "Sharpness", "NodeSocketFloat", default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")
+    have = {item.name for item in ng.interface.items_tree}
+    for name, kind, io, kw in (
+            ("Blend", "NodeSocketFloat", "OUTPUT", {}),
+            ("Blend", "NodeSocketFloat", "INPUT",
+             dict(default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")),
+            ("Noise Scale", "NodeSocketFloat", "INPUT", dict(default_value=5.0, min_value=0.0)),
+            ("Breakup", "NodeSocketFloat", "INPUT",
+             dict(default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")),
+            ("Sharpness", "NodeSocketFloat", "INPUT",
+             dict(default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")),
+            ("Crevices", "NodeSocketFloat", "INPUT",
+             dict(default_value=0.0, min_value=0.0, max_value=1.0, subtype="FACTOR")),
+            ("Cavity", "NodeSocketFloat", "INPUT",
+             dict(default_value=0.5, min_value=0.0, max_value=1.0, subtype="FACTOR"))):
+        if (name, io) == ("Blend", "OUTPUT"):
+            if not any(i.item_type == "SOCKET" and i.in_out == "OUTPUT" for i in ng.interface.items_tree):
+                _socket(ng, name, kind, io)
+        elif not any(i.item_type == "SOCKET" and i.in_out == "INPUT" and i.name == name
+                     for i in ng.interface.items_tree):
+            _socket(ng, name, kind, **kw)
+    ng.nodes.clear()
     link = ng.links.new
     gin = _node(ng, "NodeGroupInput", -900, 0)
     gout = _node(ng, "NodeGroupOutput", 900, 0)
@@ -1292,10 +1360,11 @@ def _build_breakup(ng):
     centred = math(-500, -300, "SUBTRACT", noise.outputs["Fac"], 0.5)
     envelope = math(-500, 0, "MULTIPLY", g["Blend"], math(-700, 100, "SUBTRACT", 1.0, g["Blend"]))
     # Noise Fac sits roughly in 0.2..0.8, so *8 lets Breakup = 1 swing the middle of the ramp
-    # (envelope 0.25) all the way to 0 or 1.
-    delta = math(-100, -200, "MULTIPLY",
-                 math(-300, -200, "MULTIPLY", math(-300, -350, "MULTIPLY", centred, g["Breakup"]),
-                      envelope), 8.0)
+    # (envelope 0.25) all the way to 0 or 1. Cavity spans 0..1, so (cavity - 0.5) * 8 does the
+    # same for Crevices = 1 on a full crevice or ridge.
+    push = math(-300, -250, "ADD", math(-300, -350, "MULTIPLY", centred, g["Breakup"]),
+                math(-300, -450, "MULTIPLY", math(-500, -450, "SUBTRACT", g["Cavity"], 0.5), g["Crevices"]))
+    delta = math(-100, -200, "MULTIPLY", math(-200, -200, "MULTIPLY", push, envelope), 8.0)
     broken = math(100, 0, "ADD", g["Blend"], delta, clamp=True)
     # 0.49, not 0.5: at Sharpness 1 the window is [0.49, 0.51] -- a hard edge, but never a
     # zero-width range to divide by.
@@ -1311,15 +1380,40 @@ def _build_breakup(ng):
 
 
 def breakup_group():
-    """The shared edge-breakup shader group, found by its stamp and created on first use."""
+    """The shared edge-breakup shader group, found by its stamp, created on first use and
+    rebuilt in place (keeping every material's values) when it predates this version."""
     ng = next((ng for ng in bpy.data.node_groups if ng.bl_idname == "ShaderNodeTree"
                and ng.get(GENERATED_KEY) == "breakup"), None)
     if ng is None:
         ng = bpy.data.node_groups.new(BREAKUP_GROUP, "ShaderNodeTree")
         ng[GENERATED_KEY] = "breakup"
+    if ng.get(VERSION_KEY, 0) < BREAKUP_VERSION or not ng.nodes:
         _build_breakup(ng)
         ng[VERSION_KEY] = BREAKUP_VERSION
     return ng
+
+
+# What a new blend's Edge Breakup starts at: a broken edge, soil in the crevices. Fitted to
+# the object with its distances (fit_breakup), so a scan looks right without hand tuning.
+BREAKUP_FIT = {"Breakup": 0.5, "Sharpness": 0.75, "Crevices": 0.8}
+
+
+def fit_breakup(obj):
+    """Set the Edge Breakup of each of `obj`'s blended materials to the fitted defaults, with
+    noise features about two thirds of its Contact Distance across, in the object's own space."""
+    mod = find_mod(obj)
+    contact = socket(mod, "Contact Distance") if mod else None
+    if not contact:
+        return
+    world_per_unit = max(abs(v) for v in obj.matrix_world.to_scale()) or 1.0
+    scale = min(max(1.5 * world_per_unit / contact, 0.01), 1e4)
+    for slot in obj.material_slots:
+        node = breakup_node(slot.material) if slot.material else None
+        if node is None:
+            continue
+        for name, value in BREAKUP_FIT.items():
+            node.inputs[name].default_value = value
+        node.inputs["Noise Scale"].default_value = scale
 
 
 def _is_breakup(node):
@@ -1333,7 +1427,8 @@ def breakup_node(mat):
 
 
 def _wire_breakup(tree, mix_name):
-    """Put a breakup node between the `blend` Attribute node and the mix factor.
+    """Put a breakup node between the `blend` Attribute node and the mix factor, and feed it
+    the object's `cb_cavity`.
 
     Only when the factor still comes straight from that Attribute node -- the layout every
     earlier release built. If the user has rewired it, that wiring is theirs; leave it alone.
@@ -1343,7 +1438,9 @@ def _wire_breakup(tree, mix_name):
         return None
     upstream = socket.links[0].from_node
     if _is_breakup(upstream):
-        return upstream
+        upstream.node_tree = breakup_group()      # upgrade a material wired by version 1
+        _wire_cavity(tree, upstream.name)
+        return tree.nodes[upstream.name]
     if upstream.type != "ATTRIBUTE" or upstream.attribute_name != ATTR:
         return None
     attr_name = upstream.name
@@ -1358,7 +1455,22 @@ def _wire_breakup(tree, mix_name):
     name = node.name
     tree.links.new(tree.nodes[attr_name].outputs[out_idx], tree.nodes[name].inputs["Blend"])
     tree.links.new(tree.nodes[name].outputs["Blend"], tree.nodes[mix_name].inputs[0])
+    _wire_cavity(tree, name)
     return tree.nodes[name]
+
+
+def _wire_cavity(tree, name):
+    """Feed `cb_cavity` into the breakup node `name`, unless its Cavity input is wired."""
+    sock = tree.nodes[name].inputs.get("Cavity")
+    if sock is None or sock.is_linked:
+        return
+    attr = tree.nodes.new("ShaderNodeAttribute")
+    attr.attribute_type = "GEOMETRY"
+    attr.attribute_name = CAVITY_ATTR
+    attr[GENERATED_KEY] = "attribute"
+    x, y = tree.nodes[name].location
+    attr.location = (x - 220, y - 220)
+    tree.links.new(attr.outputs["Fac"], tree.nodes[name].inputs["Cavity"])
 
 
 def _private_material(src, slot):
@@ -1769,15 +1881,18 @@ def target_displaces(mod):
     return out
 
 
-def object_width(obj):
-    """Smallest of the horizontal (world X/Y) extents and the height of `obj`'s own mesh, in
-    metres, or None.
+def object_width(obj, target=None):
+    """Smallest of the horizontal (world X/Y) extents and the exposed height of `obj`'s own
+    mesh, in metres, or None.
 
     Measured from the mesh data, not the evaluated object: once the blend exists the evaluated
     mesh has the whole ground joined into it. The smaller horizontal side, so a long log or a
     thin wall gets a contact band sized to its thickness rather than to its length; and never
     more than the height, so a low boulder or a paving slab is not buried in ground colour
     up to its top (a 2.6 m wide, 1.1 m high scanned boulder got 0.8 m of blend from its width).
+    With a `target`, the height is the part that shows above it -- the ground level under the
+    object's footprint, from the target as evaluated -- because that is what the eye sizes the
+    contact against: a stone sunk to half its height got a meniscus twice too big for it.
     """
     import numpy as np
     if obj.type != "MESH" or not obj.data.vertices:
@@ -1786,25 +1901,55 @@ def object_width(obj):
     obj.data.vertices.foreach_get("co", co)
     m = np.array(obj.matrix_world, dtype=np.float64)
     world = co.reshape(-1, 3) @ m[:3, :3].T + m[:3, 3]
-    extent = world.max(axis=0) - world.min(axis=0)
-    return float(min(extent[0], extent[1], extent[2]))
+    lo, hi = world.min(axis=0), world.max(axis=0)
+    extent = hi - lo
+    height = extent[2]
+    level = _ground_level(target, lo, hi) if target is not None else None
+    if level is not None:
+        height = min(height, max(hi[2] - level, 0.0))
+    return float(min(extent[0], extent[1], height)) or None
 
 
-def fit_to_object(mod, obj):
+def _ground_level(target, lo, hi):
+    """Median height of `target`'s evaluated surface under the XY box lo..hi, from rays cast
+    straight down at a 3x3 grid over it, or None where nothing is under it."""
+    from mathutils import Vector
+    if target is None or target.type != "MESH":
+        return None
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    ev = target.evaluated_get(depsgraph)
+    to_local = target.matrix_world.inverted()
+    down = (to_local.to_3x3() @ Vector((0, 0, -1))).normalized()
+    heights = []
+    for fx in (0.2, 0.5, 0.8):
+        for fy in (0.2, 0.5, 0.8):
+            origin = Vector((lo[0] + fx * (hi[0] - lo[0]), lo[1] + fy * (hi[1] - lo[1]), hi[2] + 1.0))
+            hit, where, *_ = ev.ray_cast(to_local @ origin, down)
+            if hit:
+                heights.append((target.matrix_world @ where).z)
+    if not heights:
+        return None
+    heights.sort()
+    return float(heights[len(heights) // 2])
+
+
+def fit_to_object(mod, obj, target=None):
     """Size the distance settings to `obj`, so a pebble and a boulder both start sensibly.
 
     A fixed 0.3 m Contact Distance swallows a 5 cm pebble whole and is invisible under a 20 m
-    boulder. Contact Distance ~1/3 of the object's smallest extent (see `object_width`) matches
-    the advice that always went with it; the rest follow in proportion (Surface Offset lands on
-    the old 0.002 m for a ~0.5 m object). Only ever called on a new blend or on explicit
+    boulder. Contact Distance ~1/3 of the object's smallest extent above the ground (see
+    `object_width`) matches the advice that always went with it; Material Blend is half of
+    it -- the Edge Breakup breaks that band up into soil in the crevices, and a wider band only
+    smeared ground colour up the rock -- and the rest follow in proportion (Surface Offset lands
+    on the old 0.002 m for a ~0.5 m object). Only ever called on a new blend or on explicit
     request: on Update or a re-apply these are the user's values.
     """
-    width = object_width(obj)
+    width = object_width(obj, target if target is not None else mod_target(mod))
     if not width:
         return False
     contact = min(max(width / 3, 0.001), 50.0)
     set_socket(mod, "Contact Distance", contact)
-    set_socket(mod, "Material Blend Distance", contact)
+    set_socket(mod, "Material Blend Distance", contact / 2)
     set_socket(mod, "Normal Blend Distance", contact * 2 / 3)
     set_socket(mod, "Surface Offset", min(max(contact * 0.012, 1e-5), 0.05))
     obj.update_tag()
@@ -2548,7 +2693,7 @@ class CONTACTBLEND_OT_add(bpy.types.Operator):
             if mod is None:
                 mod = hero.modifiers.new(GROUP, "NODES")
                 mod.node_group = build_group()
-                fit_to_object(mod, hero)
+                fit_to_object(mod, hero, tgt)
                 set_socket(mod, "Contact Smoothing", SMOOTHING)
                 share(mod)
                 created.append(hero)
@@ -2567,6 +2712,8 @@ class CONTACTBLEND_OT_add(bpy.types.Operator):
             err = _finish_blend(ctx, hero, find_mod(hero))
             if err:
                 errors.append(err)
+            elif hero in created:
+                fit_breakup(hero)
         for obj in converted:
             if obj not in r.heroes:
                 _finish_blend(ctx, obj, find_mod(obj), refresh_material=False)
@@ -2664,6 +2811,8 @@ class CONTACTBLEND_OT_fit(bpy.types.Operator):
 
     def execute(self, ctx):
         fitted = [o for o in _selected_blends(ctx) if fit_to_object(find_mod(o), o)]
+        for obj in fitted:
+            fit_breakup(obj)
         if not fitted:
             self.report({"ERROR"}, "Nothing with vertices to measure")
             return {"CANCELLED"}

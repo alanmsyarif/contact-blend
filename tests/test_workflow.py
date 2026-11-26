@@ -427,8 +427,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(mix.inputs[0].links[0].from_node, node)
         attr = node.inputs["Blend"].links[0].from_node
         self.assertEqual((attr.type, attr.attribute_name), ("ATTRIBUTE", cb.ATTR))
-        self.assertEqual(node.inputs["Breakup"].default_value, 0.0)
-        self.assertEqual(node.inputs["Sharpness"].default_value, 0.0)
+        # A new blend starts with a fitted broken edge (deliberate in 2.0: it started at the
+        # identity, which reads as an airbrushed band on every scan): soil in the crevices,
+        # read from the object's cb_cavity, and noise about 2/3 of Contact Distance across.
+        for name, value in cb.BREAKUP_FIT.items():
+            self.assertAlmostEqual(node.inputs[name].default_value, value, places=6)
+        contact = cb.socket(cb.find_mod(self.source), "Contact Distance")
+        self.assertAlmostEqual(node.inputs["Noise Scale"].default_value, 1.5 / contact, places=3)
+        cavity = node.inputs["Cavity"].links[0].from_node
+        self.assertEqual((cavity.type, cavity.attribute_name), ("ATTRIBUTE", cb.CAVITY_ATTR))
         # noise is in the hero's object space, not on its UVs
         group = node.node_tree
         noise = next(n for n in group.nodes if n.type == "TEX_NOISE")
@@ -571,10 +578,13 @@ class WorkflowTests(unittest.TestCase):
         return obj, mod, ids
 
     def test_new_blend_fits_distances_to_object_size(self):
-        for size, contact, offset in ((0.05, 0.05 / 3, 0.0002), (0.5, 0.5 / 3, 0.002), (20, 20 / 3, 0.05)):
+        # the 20 m cube spans the 2 m ground cube, whose top (z = 1) is inside it: 19 m shows
+        for size, contact, offset in ((0.05, 0.05 / 3, 0.0002), (0.5, 0.5 / 3, 0.002), (20, 19 / 3, 0.05)):
             obj, mod, ids = self.fitted(size)
             self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), contact, places=5)
-            self.assertAlmostEqual(cb.socket(mod, "Material Blend Distance"), contact, places=5)
+            # half of Contact Distance (deliberate in 2.0: it was all of it, which smeared ground
+            # colour up every scan; the Edge Breakup now breaks the band up instead)
+            self.assertAlmostEqual(cb.socket(mod, "Material Blend Distance"), contact / 2, places=5)
             self.assertAlmostEqual(cb.socket(mod, "Normal Blend Distance"), contact * 2 / 3, places=5)
             self.assertAlmostEqual(cb.socket(mod, "Surface Offset"), offset, places=6)
             self.target.hide_set(False)
@@ -595,9 +605,27 @@ class WorkflowTests(unittest.TestCase):
         slab.data.materials.append(self.source.active_material)
         mod = self.apply(slab)
         self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), 0.02, places=5)
-        self.assertAlmostEqual(cb.socket(mod, "Material Blend Distance"), 0.02, places=5)
+        self.assertAlmostEqual(cb.socket(mod, "Material Blend Distance"), 0.01, places=5)
         self.assertAlmostEqual(cb.socket(mod, "Normal Blend Distance"), 0.02 * 2 / 3, places=5)
         self.assertAlmostEqual(cb.socket(mod, "Surface Offset"), 0.02 * 0.012, places=6)
+
+    def test_fit_measures_only_what_shows_above_the_ground(self):
+        # A 0.6 m cube sunk to half its height shows 0.3 m: the contact is sized to that, as the
+        # eye sizes it. Measured from the whole object a half-buried stone got a meniscus twice
+        # too big for it (the macro demo's 15 cm stone, sunk 45%: 2.7 cm of mound around it).
+        bpy.ops.mesh.primitive_plane_add(size=20, location=(5, 5, 0.0))
+        plane = bpy.context.object
+        plane.data.materials.append(self.target.active_material)
+        bpy.ops.mesh.primitive_cube_add(size=0.6, location=(5, 5, 0.0))
+        cube = bpy.context.object
+        cube.data.materials.append(self.source.active_material)
+        mod = self.apply(cube, plane)
+        self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), 0.3 / 3, places=4)
+        cube.location.z = 0.3                       # now resting on the ground: all of it shows
+        bpy.context.view_layer.update()
+        self.activate(cube)
+        self.assertEqual(bpy.ops.object.contact_blend_fit(), {"FINISHED"})
+        self.assertAlmostEqual(cb.socket(mod, "Contact Distance"), 0.6 / 3, places=4)
 
     def test_user_distances_survive_reapply_and_update_until_fit(self):
         obj, mod, ids = self.fitted(0.5)

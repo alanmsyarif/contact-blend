@@ -9,7 +9,7 @@ import time
 import unittest
 
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
 from mathutils.bvhtree import BVHTree
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -381,6 +381,90 @@ class GeometryTests(unittest.TestCase):
         own = len(rock.data.loops)
         lengths = [n.vector.length for n in list(me.corner_normals)[:own]]
         self.assertGreater(min(lengths), 0.999, f"collapsed welded normal: {min(lengths):.3f}")
+
+    def test_cavity_marks_crevices_and_ridges(self):
+        # The shader's Edge Breakup puts ground material in a rock's crevices and keeps its
+        # ridges clear (a real junction is a broken edge, not a smeared gradient); the object
+        # has to tell it which is which. A sheet corrugated on one half, flat on the other.
+        import math
+        ground = grid("Ground", 4, 40)
+        self.material(ground, "Ground")
+        cells, size, wave = 64, 1.0, 0.25
+        sheet = grid("Sheet", size, cells,
+                     height=lambda x, y: 0.02 * math.cos(2 * math.pi * x / wave) if x < 0 else 0.0)
+        sheet.location = (0.1, 0.0, 0.2)
+        self.material(sheet, "Rock")
+        self.apply(sheet, ground)
+        me = self.evaluated(sheet)
+        self.assertIn(cb.CAVITY_ATTR, me.attributes, "no cavity for the shader to read")
+        cavity = me.attributes[cb.CAVITY_ATTR].data
+        troughs, crests, flat = [], [], []
+        for v in me.vertices:
+            x, y, z = v.co
+            if abs(y) > 0.3 or abs(z) > 0.05:
+                continue                      # away from the sheet's border; not the joined ground
+            if -0.4 < x < -0.1:
+                phase = (x / wave) % 1.0
+                if min(phase, 1 - phase) < 0.05:
+                    crests.append(cavity[v.index].value)
+                elif abs(phase - 0.5) < 0.05:
+                    troughs.append(cavity[v.index].value)
+            elif 0.15 < x < 0.4:
+                flat.append(cavity[v.index].value)
+        self.assertTrue(troughs and crests and flat, "the test is not biting: no samples")
+        self.assertGreater(min(troughs), 0.9, "a trough does not read as a crevice")
+        self.assertLess(max(crests), 0.1, "a crest does not read as a ridge")
+        for value in flat:
+            self.assertAlmostEqual(value, 0.5, delta=1e-4, msg="a flat surface reads as uneven")
+
+    def test_weld_does_not_bend_towards_what_the_object_blocks(self):
+        # Under an overhang the ground's normal points into the object's own rock. Welded
+        # towards it, faces the object shadows shaded as lit up to the shadow's edge: hard dark
+        # shards along the junction of a coarse scan in low sun (the macro demo). A stem under
+        # a wide cap must bend far less than the same stem standing in the open.
+        import bmesh
+
+        def stem(capped, x):
+            bm = bmesh.new()
+            bmesh.ops.create_cube(bm, size=1.0, matrix=Matrix.Diagonal((0.2, 0.2, 0.4, 1.0)))
+            if capped:
+                bmesh.ops.create_cube(bm, size=1.0, matrix=Matrix.Translation((0, 0, 0.225))
+                                      @ Matrix.Diagonal((0.9, 0.9, 0.05, 1.0)))
+            bmesh.ops.subdivide_edges(bm, edges=bm.edges[:], cuts=6, use_grid_fill=True)
+            me = bpy.data.meshes.new("Stem")
+            bm.to_mesh(me)
+            bm.free()
+            obj = bpy.data.objects.new("Capped" if capped else "Open", me)
+            bpy.context.collection.objects.link(obj)
+            obj.location = (x, 0.03, 0.2)
+            self.material(obj, obj.name)
+            return obj
+
+        ground = grid("Ground", 6, 60)
+        self.material(ground, "Ground")
+        bent = {}
+        for capped, x in ((False, -1.5), (True, 1.5)):
+            obj = stem(capped, x)
+            mod, ids = self.apply(obj, ground)
+            obj.contact_blend_displace = False
+            cb.set_socket(mod, "Normal Blend Distance", 0.15)
+            obj.update_tag()
+            me = self.evaluated(obj)
+            own = {i: p.normal.copy() for p in obj.data.polygons for i in p.loop_indices}
+            angles = []
+            for poly in obj.data.polygons:
+                if abs(poly.normal.z) > 0.1:
+                    continue                     # walls only
+                for i in poly.loop_indices:
+                    z = (obj.matrix_world @ me.vertices[me.loops[i].vertex_index].co).z
+                    if 0.01 < z < 0.08 and abs(obj.data.vertices[obj.data.loops[i].vertex_index].co.x) < 0.11 \
+                            and abs(obj.data.vertices[obj.data.loops[i].vertex_index].co.y) < 0.11:
+                        angles.append(me.corner_normals[i].vector.normalized().angle(own[i]))
+            self.assertGreater(len(angles), 20, "no stem walls in the weld band; the test is not biting")
+            bent[capped] = sum(angles) / len(angles)
+        self.assertGreater(bent[False], 0.3, "the open stem is not welded; the test is not biting")
+        self.assertLess(bent[True], 0.5 * bent[False],
+                        f"welded towards the overhang: {bent[True]:.3f} vs {bent[False]:.3f} rad in the open")
 
     def test_instanced_target_is_realized(self):
         ground = grid("Ground", 4, 40)

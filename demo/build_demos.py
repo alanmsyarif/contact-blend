@@ -7,6 +7,7 @@ Run with the Python interpreter that has the `bpy` module (or `blender -b -P`):
     python demo/build_demos.py --scene forest      # one scene
     python demo/build_demos.py --no-render         # build and save the .blend files only
     python demo/build_demos.py --preview           # quick low-resolution renders
+    python demo/build_demos.py --wire              # also the wireframe set and the breakdown
 
 Assets are cached in demo/assets/. Each scene is built with the add-on's real operators -- the
 Ground picker plus `object.contact_blend`, exactly what an artist's clicks do -- then tuned
@@ -18,6 +19,7 @@ import argparse
 import json
 import math
 import pathlib
+import random
 import re
 import sys
 import time
@@ -25,6 +27,7 @@ import urllib.request
 
 import bpy
 from mathutils import Euler, Vector
+from mathutils.bvhtree import BVHTree
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -72,15 +75,17 @@ def model(asset, res="2k"):
     return _download(entry["url"], folder / pathlib.Path(entry["url"]).name)
 
 
-def texture(asset, res="2k"):
-    """{map: path} for a texture set: colour, normal (GL), roughness (JPG), height (16-bit PNG)."""
+def texture(asset, res="2k", disp_res=None):
+    """{map: path} for a texture set: colour, normal (GL), roughness (JPG), height (16-bit PNG).
+    The height map can be fetched at its own resolution: a 16-bit 8k PNG is a gigabyte in
+    memory once decoded."""
     USED[asset] = "texture"
     files = api(f"files/{asset}")
     out = {}
     for key, kind, fmt in (("Diffuse", "diff", "jpg"), ("nor_gl", "nor", "jpg"),
                            ("Rough", "rough", "jpg"), ("Displacement", "disp", "png")):
         if key in files:
-            url = files[key][res][fmt]["url"]
+            url = files[key][disp_res or res if kind == "disp" else res][fmt]["url"]
             out[kind] = _download(url, ASSETS / "textures" / asset / pathlib.Path(url).name)
     return out
 
@@ -153,7 +158,7 @@ def _image(path, colour=True):
     return img
 
 
-def ground_material(name, maps, tile, variation=True):
+def ground_material(name, maps, tile, variation=True, shade=(0.9, 1.07), micro=0.0):
     """A ground shader with its maps at real-world scale and the tiling broken up.
 
     The same texture repeating every couple of metres is the first thing that gives a ground
@@ -187,9 +192,10 @@ def ground_material(name, maps, tile, variation=True):
         noise.inputs["Scale"].default_value = 0.25          # patches of a few metres
         noise.inputs["Detail"].default_value = 4
         tree.links.new(uv.outputs["UV"], noise.inputs["Vector"])
-        shade = tree.nodes.new("ShaderNodeMapRange")       # 0.8x .. 1.15x brightness
+        lo, hi = shade
+        shade = tree.nodes.new("ShaderNodeMapRange")       # a gentle brightness drift
         shade.inputs[1].default_value, shade.inputs[2].default_value = 0.3, 0.7
-        shade.inputs[3].default_value, shade.inputs[4].default_value = 0.8, 1.15
+        shade.inputs[3].default_value, shade.inputs[4].default_value = lo, hi
         tree.links.new(noise.outputs["Fac"], shade.inputs[0])
         mul = tree.nodes.new("ShaderNodeMix")
         mul.data_type, mul.blend_type = "RGBA", "MULTIPLY"
@@ -211,7 +217,31 @@ def ground_material(name, maps, tile, variation=True):
         nmap = tree.nodes.new("ShaderNodeNormalMap")
         tree.links.new(sampled(maps["nor"], False), nmap.inputs["Color"])
         tree.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+    if micro:
+        # Grain-scale relief as true micro-displacement, diced per pixel by Cycles' adaptive
+        # subdivision (see micro_displace): grains that cast shadows in a raking sun. The
+        # add-on conforms the ground's geometry; this rides on top of it, ground and meniscus.
+        disp = tree.nodes.new("ShaderNodeDisplacement")
+        disp.inputs["Midlevel"].default_value = 0.5
+        disp.inputs["Scale"].default_value = micro
+        tree.links.new(sampled(maps["disp"], False), disp.inputs["Height"])
+        tree.links.new(disp.outputs[0], out.inputs["Displacement"])
+        mat.displacement_method = "DISPLACEMENT"
     return mat
+
+
+def micro_displace(obj, pixel=1.0):
+    """Dice `obj` per pixel at render time (adaptive subdivision, last in its stack) so its
+    material's displacement makes real geometry."""
+    sub = obj.modifiers.new("Micro", "SUBSURF")
+    sub.subdivision_type = "SIMPLE"
+    # 0 levels in the viewport and at render: Cycles dices it itself. Render levels left at the
+    # default 2 were applied wherever the ground is read as geometry -- the add-on's Object
+    # Info of it included -- and the contact conform ran on 15 million faces.
+    sub.levels = sub.render_levels = 0
+    sub.use_adaptive_subdivision = True
+    sub.adaptive_pixel_size = pixel
+    return sub
 
 
 def ground(name, size, cells, maps, tile, height, material=None):
@@ -322,8 +352,10 @@ def sun_rotation(path, azimuth_deg):
     row, col = np.unravel_index(np.argmax(lum), lum.shape)
     u, v = (col + 0.5) / w, (row + 0.5) / h
     # Blender's equirectangular lookup: u = atan2(y, -x) / 2pi + 0.5
+    # (checked by rendering a sphere lit by the result: a 180 degree error here lit every
+    # earlier version of these scenes from the opposite side to the one asked for)
     phi = (u - 0.5) * 2 * math.pi
-    sun_azimuth = math.degrees(math.atan2(math.sin(phi), -math.cos(phi)))
+    sun_azimuth = math.degrees(math.atan2(math.sin(phi), -math.cos(phi))) + 180.0
     elevation = math.degrees((v - 0.5) * math.pi)
     print(f"{path.name}: sun at azimuth {sun_azimuth:.0f}, elevation {elevation:.0f}", flush=True)
     return sun_azimuth - azimuth_deg
@@ -344,6 +376,38 @@ def place(obj, location, rotation_deg=(0, 0, 0), scale=1.0, sink=0.3):
                     location[2] - low - sink * (high - low))
     bpy.context.view_layer.update()
     return obj
+
+
+def scatter(templates, floor, count, area, scale, seed, avoid=(), sink=0.15, tilt=6.0,
+            name="Scatter"):
+    """`count` linked duplicates of `templates` dropped onto `floor` inside `area` ((x0, x1),
+    (y0, y1)), away from the `avoid` discs ((x, y), r), each turned at random and sunk `sink`
+    of its height. Linked duplicates share their mesh: dozens cost one mesh's memory."""
+    rng = random.Random(seed)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    surface = BVHTree.FromObject(floor, depsgraph)
+    to_floor = floor.matrix_world.inverted()
+    placed, tries = [], 0
+    while len(placed) < count and tries < count * 60:
+        tries += 1
+        x, y = rng.uniform(*area[0]), rng.uniform(*area[1])
+        if any((Vector((x, y)) - Vector(c)).length < r for c, r in avoid):
+            continue
+        if any((Vector((x, y)) - o.location.xy).length < 0.6 * max(o.dimensions.xy) for o in placed):
+            continue
+        hit, *_ = surface.ray_cast(to_floor @ Vector((x, y, 50.0)), Vector((0, 0, -1)))
+        if hit is None:
+            continue
+        z = (floor.matrix_world @ hit).z
+        obj = rng.choice(templates).copy()
+        bpy.context.scene.collection.objects.link(obj)
+        obj.name = f"{name}.{len(placed):03d}"
+        place(obj, (x, y, z), (rng.uniform(-tilt, tilt), rng.uniform(-tilt, tilt), rng.uniform(0, 360)),
+              rng.uniform(*scale), sink=sink)
+        placed.append(obj)
+    for t in templates:
+        bpy.data.objects.remove(t)          # the copies keep the mesh
+    return placed
 
 
 def blend_into(ground_obj, objs):
@@ -411,7 +475,11 @@ def render_settings(scene, samples, exposure=0.0, preview=False):
     scene.cycles.device = "CPU"
     scene.cycles.samples = 24 if preview else samples
     scene.cycles.use_adaptive_sampling = True
-    scene.cycles.adaptive_threshold = 0.02 if preview else 0.008
+    scene.cycles.adaptive_threshold = 0.02 if preview else 0.005
+    scene.cycles.denoising_input_passes = "RGB_ALBEDO_NORMAL"
+    scene.cycles.denoising_prefilter = "ACCURATE"
+    scene.cycles.dicing_rate = 1.0
+    scene.cycles.offscreen_dicing_scale = 16.0       # micro-displacement: dice what is seen
     scene.cycles.use_denoising = True
     scene.cycles.denoiser = "OPENIMAGEDENOISE"
     scene.cycles.sample_clamp_indirect = 6.0      # no fireflies from the sun's bounce
@@ -437,6 +505,12 @@ def render(scene, cam, path, size=(1920, 1080), samples=None, preview=False):
     print(f"rendered {path.name} in {time.time() - t0:.0f} s", flush=True)
 
 
+def _label(draw, xy, text):
+    x, y = xy
+    draw.text((x + 1, y + 1), text, fill=(0, 0, 0))
+    draw.text((x, y), text, fill=(255, 255, 255))
+
+
 def composite(before, after, out):
     """Left half before, right half after, split by a thin line, with small labels."""
     from PIL import Image, ImageDraw
@@ -446,10 +520,115 @@ def composite(before, after, out):
     img.paste(b.crop((w // 2, 0, w, h)), (w // 2, 0))
     draw = ImageDraw.Draw(img)
     draw.line([(w // 2, 0), (w // 2, h)], fill=(255, 255, 255), width=max(2, w // 640))
-    for text, x in (("without Contact Blend", 16), ("with Contact Blend", w // 2 + 16)):
-        draw.text((x + 1, h - 31), text, fill=(0, 0, 0))
-        draw.text((x, h - 32), text, fill=(255, 255, 255))
+    _label(draw, (16, h - 32), "without Contact Blend")
+    _label(draw, (w // 2 + 16, h - 32), "with Contact Blend")
     img.save(out, quality=92)
+
+
+def breakdown(render_before, render_after, wire_before, wire_after, out, size=(1920, 1080)):
+    """Four-up: renders on top, wireframes below; without Contact Blend left, with it right."""
+    from PIL import Image, ImageDraw
+    w, h = size[0] // 2, size[1] // 2
+    img = Image.new("RGB", size)
+    tiles = ((render_before, 0, 0, "render, without Contact Blend"),
+             (render_after, w, 0, "render, with Contact Blend"),
+             (wire_before, 0, h, "wireframe, without"),
+             (wire_after, w, h, "wireframe, with"))
+    draw = ImageDraw.Draw(img)
+    for path, x, y, text in tiles:
+        img.paste(Image.open(path).convert("RGB").resize((w, h), Image.LANCZOS), (x, y))
+    for path, x, y, text in tiles:
+        _label(draw, (x + 14, y + h - 28), text)
+    draw.line([(w, 0), (w, size[1])], fill=(255, 255, 255), width=2)
+    draw.line([(0, h), (size[0], h)], fill=(255, 255, 255), width=2)
+    img.save(out, quality=92)
+
+
+def wire_material():
+    """Clay with dark anti-aliased edges of the *evaluated* triangles (the Wireframe node sees
+    the geometry Cycles renders: the conformed, subdivided ground and every welded junction)."""
+    mat = bpy.data.materials.get("Wire clay") or bpy.data.materials.new("Wire clay")
+    tree = mat.node_tree
+    tree.nodes.clear()
+    out = tree.nodes.new("ShaderNodeOutputMaterial")
+    clay = tree.nodes.new("ShaderNodeBsdfDiffuse")
+    clay.inputs["Color"].default_value = (0.42, 0.42, 0.40, 1)
+    ink = tree.nodes.new("ShaderNodeBsdfDiffuse")
+    ink.inputs["Color"].default_value = (0.015, 0.015, 0.02, 1)
+    wire = tree.nodes.new("ShaderNodeWireframe")
+    wire.use_pixel_size = True
+    wire.inputs["Size"].default_value = 0.55
+    mix = tree.nodes.new("ShaderNodeMixShader")
+    tree.links.new(wire.outputs[0], mix.inputs[0])
+    tree.links.new(clay.outputs[0], mix.inputs[1])
+    tree.links.new(ink.outputs[0], mix.inputs[2])
+    tree.links.new(mix.outputs[0], out.inputs["Surface"])
+    return mat
+
+
+def render_wire(scene, cam, path, preview):
+    """The wireframe view from `cam`: every material overridden by wire clay, depth of field
+    and per-pixel dicing off so the edges are the mesh's own and sharp."""
+    layer = bpy.context.view_layer
+    layer.material_override = wire_material()
+    dof = cam.data.dof.use_dof
+    cam.data.dof.use_dof = False
+    adaptive = [m for o in scene.objects for m in o.modifiers
+                if m.type == "SUBSURF" and getattr(m, "use_adaptive_subdivision", False)]
+    for m in adaptive:
+        m.use_adaptive_subdivision = False
+    samples = scene.cycles.samples
+    try:
+        render(scene, cam, path, (1280, 720), 48, preview)
+    finally:
+        layer.material_override = None
+        cam.data.dof.use_dof = dof
+        for m in adaptive:
+            m.use_adaptive_subdivision = True
+        scene.cycles.samples = samples
+
+
+def record(name, heroes, proxy, timings):
+    """Every setting the blend actually used, per object and on the shared ground, plus the
+    measured timings: demo/renders/<scene>.json, for anyone quoting the renders."""
+    def inputs(mod):
+        out = {}
+        for item in mod.node_group.interface.items_tree:
+            if item.item_type != "SOCKET" or item.in_out != "INPUT":
+                continue
+            v = cb.socket(mod, item.name)
+            if isinstance(v, (int, float, bool, str)):
+                out[item.name] = round(v, 6) if isinstance(v, float) else v
+            elif v is not None and hasattr(v, "name"):
+                out[item.name] = v.name
+        return out
+    data = {"objects": {}, "ground": inputs(cb.ground_mod(proxy)), "timings_s": timings}
+    for obj in heroes:
+        entry = {"settings": inputs(cb.find_mod(obj)), "breakup": {}}
+        for slot in obj.material_slots:
+            node = cb.breakup_node(slot.material) if slot.material else None
+            if node:
+                entry["breakup"][slot.material.name] = {
+                    i.name: round(i.default_value, 6) for i in node.inputs
+                    if i.name != "Blend" and not i.is_linked}
+        data["objects"][obj.name] = entry
+    (RENDERS / f"{name}.json").write_text(json.dumps(data, indent=2))
+
+
+def save_light(name):
+    """Save demo/<name>.blend with every texture packed, images over 2k packed as 2k copies:
+    the renders use full resolution, the file stays small enough to keep in the repository."""
+    for img in bpy.data.images:
+        if img.source == "FILE" and max(img.size) > 2048:
+            w, h = img.size
+            f = 2048 / max(w, h)
+            img.scale(max(1, int(w * f)), max(1, int(h * f)))
+            img.pack()
+    bpy.ops.file.pack_all()
+    path = HERE / f"{name}.blend"
+    bpy.ops.wm.save_as_mainfile(filepath=str(path), compress=True)
+    print(f"saved {path.name}: {path.stat().st_size / 1e6:.1f} MB", flush=True)
+    return path.stat().st_size / 1e6
 
 
 # --- the scenes ------------------------------------------------------------------------------
@@ -462,37 +641,68 @@ def scene(fn):
     return fn
 
 
+def lod0(asset, names=None):
+    return append_objects(model(asset), names=names)
+
+
 @scene
 def forest(args):
-    """Two mossy boulders settled into a forest floor, soft light under the canopy."""
+    """Mossy rocks and pine roots settled into a leaf-littered forest floor, low warm sun
+    through the trees, seen from a crouch."""
     scene = reset()
-    sky = hdri("forest_slope")
-    world(scene, sky, rotation_deg=sun_rotation(sky, 150), strength=1.0)
-    maps = texture("forest_ground_04")
-    tile = texture_size("forest_ground_04")
-    floor = ground("Forest floor", 16, 1600, maps, tile, height=0.08,
+    sky = hdri("autumn_forest_04")
+    world(scene, sky, rotation_deg=sun_rotation(sky, 115), strength=1.0)
+    maps = texture("forest_leaves_04", "4k")
+    tile = texture_size("forest_leaves_04")
+    floor = ground("Forest floor", 14, 1400, maps, tile, height=0.05,
                    material=ground_material("Forest floor", maps, tile))
-    rocks = append_objects(model("rock_moss_set_01"), names=("rock02", "rock03"))
-    big, small = sorted(rocks, key=lambda o: -o.dimensions.length)
-    big.name, small.name = "Mossy boulder", "Mossy rock"
-    place(big, (0.0, 0.0, 0.0), (0, 0, 35), sink=0.32)    # its scanned underside is smeared
-    place(small, (2.55, 1.4, 0.0), (0, 0, -60), sink=0.28)
-    # Looking down at the forest floor, as one photographs it: no horizon, so no tile edge.
-    return floor, [big, small], {"cams": [
-        ("hero", (3.9, -3.2, 3.3), (1.15, 0.55, 0.15), 40, 8),
-        ("compare", (3.1, -2.6, 1.9), (2.4, 0.55, 0.1), 50, 11)]}
+    rocks = lod0("rock_moss_set_02", names=("rock11", "rock08", "rock09"))
+    big = next(o for o in rocks if "rock11" in o.name)
+    mid = next(o for o in rocks if "rock08" in o.name)
+    small = next(o for o in rocks if "rock09" in o.name)
+    big.name, mid.name, small.name = "Mossy boulder", "Mossy rock", "Small mossy rock"
+    place(big, (0.0, 0.0, 0.0), (0, 0, 20), sink=0.3)
+    place(mid, (1.9, 0.9, 0.0), (0, 0, 75), sink=0.3)
+    place(small, (-1.55, -0.55, 0.0), (0, 0, -40), scale=0.6, sink=0.35)
+    roots = lod0("pine_roots", names=("pine_roots_a",))[0]
+    roots.name = "Pine roots"
+    place(roots, (-0.15, -1.45, 0.0), (0, 0, 15), sink=0.45)
+    branch = lod0("dry_branches_medium_01", names=("_a",))[0]
+    branch.name = "Fallen branch"
+    place(branch, (1.3, -1.35, 0.0), (0, 0, 70), sink=0.35)
+    blended = [big, mid, small, roots, branch]
+    keep_clear = [((0, 0), 1.3), ((1.9, 0.9), 0.8), ((-1.55, -0.55), 0.5), ((-0.15, -1.45), 0.9),
+                  ((1.3, -1.35), 0.6), ((3.0, -3.6), 1.2)]      # (the camera's own spot)
+    # the background: a fallen trunk and a stump, ferns, so the far ground is not a bare plane
+    log = lod0("dead_tree_trunk")[0]
+    place(log, (-1.8, 4.2, 0.0), (0, 0, 15), sink=0.25)
+    stump = lod0("tree_stump_01")[0]
+    place(stump, (3.4, 3.8, 0.0), (0, 0, 40), sink=0.1)
+    keep_clear += [((-1.8, 4.2), 1.6), ((3.4, 3.8), 1.0)]
+    scatter(lod0("fern_02"), floor, 16, ((-6, 6), (1.5, 6.5)), (0.7, 1.15), 3, keep_clear, sink=0.05,
+            name="Fern")
+    scatter(lod0("dry_branches_medium_01", names=("_b", "_c")), floor, 14, ((-4, 4), (-3, 4)),
+            (0.6, 1.0), 5, keep_clear, sink=0.3, tilt=4, name="Twig")
+    scatter(lod0("rock_moss_set_02", names=("rock09", "rock12")), floor, 10, ((-5, 5), (-3, 5)),
+            (0.12, 0.3), 7, keep_clear, sink=0.35, tilt=20, name="Stone")
+    apron(floor, 90, 0.1, maps, tile, height=0.05)
+    return floor, blended, {"cams": [
+        # crouching, 50 mm: the boulder's base and the roots against it are the subject
+        ("hero", (3.0, -3.6, 0.85), (0.3, 0.0, 0.05), 50, 8),
+        ("compare", (1.5, -3.3, 0.55), (0.1, -1.2, 0.15), 60, 8)]}
 
 
 @scene
 def boulders(args):
-    """Namaqualand boulders of very different sizes on dry, stony ground in hard sun."""
+    """Namaqualand boulders of very different sizes on gravelly sand under a low sunrise sun;
+    the front pair's contact bands overlap."""
     scene = reset()
-    sky = hdri("goegap")
-    world(scene, sky, rotation_deg=sun_rotation(sky, 110), strength=1.0)
-    maps = texture("dry_ground_rocks")
-    tile = texture_size("dry_ground_rocks")
-    floor = ground("Dry ground", 18, 1500, maps, tile, height=0.06,
-                   material=ground_material("Dry ground", maps, tile))
+    sky = hdri("klippad_sunrise_2")
+    world(scene, sky, rotation_deg=sun_rotation(sky, 150), strength=1.0)
+    maps = texture("gravelly_sand", "4k")
+    tile = texture_size("gravelly_sand")
+    floor = ground("Gravelly sand", 18, 1500, maps, tile, height=0.04,
+                   material=ground_material("Gravelly sand", maps, tile, shade=(0.95, 1.04)))
     layout = [  # asset, position, heading, sink -- real scale throughout
         ("namaqualand_boulder_03", (0.0, 0.0), 15, 0.22),
         ("namaqualand_boulder_05", (2.05, -0.55), 120, 0.25),     # leans on the first one's band
@@ -504,59 +714,61 @@ def boulders(args):
     for i, (asset, xy, heading, sink) in enumerate(layout):
         obj = append_objects(model(asset), rename=f"Boulder {i + 1}")[0]
         rocks.append(place(obj, (xy[0], xy[1], 0.0), (0, 0, heading), sink=sink))
-    apron(floor, 240, 0.25, maps, tile, height=0.06)
+    small = lod0("namaqualand_rocks_01")
+    rng = random.Random(11)
+    spots = [(1.0, -1.9), (-0.9, -1.6), (2.9, -1.4), (0.4, -3.1)]
+    for i, (obj, xy) in enumerate(zip(small, spots)):
+        obj.name = f"Small rock {i + 1}"
+        place(obj, (xy[0], xy[1], 0.0), (0, 0, rng.uniform(0, 360)), scale=rng.uniform(1.0, 1.6), sink=0.3)
+        rocks.append(obj)
+    keep_clear = [((0, 0), 2.2), ((2.05, -0.55), 1.1), ((-3.6, 2.4), 1.8), ((3.7, 2.6), 1.0),
+                  ((-1.9, -2.9), 1.5)] + [(xy, 0.4) for xy in spots] + [((1.2, -6.0), 1.5)]
+    scatter(lod0("namaqualand_stones_01"), floor, 70, ((-8, 8), (-6, 8)), (0.7, 1.4), 13, keep_clear,
+            sink=0.35, tilt=25, name="Stone")
+    scatter(lod0("cheiridopsis_succulent"), floor, 7, ((-8, 8), (1, 8)), (0.8, 1.1), 17, keep_clear,
+            sink=0.05, name="Succulent")
+    cliff = append_objects(model("namaqualand_cliff_02"), rename="Outcrop")[0]
+    place(cliff, (-14.0, 60.0, 0.0), (0, 0, 200), scale=1.6, sink=0.25)
+    apron(floor, 400, 0.5, maps, tile, height=0.04)
     return floor, rocks, {"cams": [
-        # From a rise, pitched down: the plain below the camera never meets the photographed
-        # horizon of the sky, which no flat ground can match.
-        ("hero", (5.5, -7.1, 4.5), (0.0, 0.0, 0.3), 35, 11),
-        ("compare", (-0.1, -4.7, 1.7), (-0.1, -1.3, 0.2), 40, 11)]}
+        ("hero", (2.4, -7.6, 1.45), (0.2, 0.0, 0.55), 45, 11),
+        ("compare", (1.0, -3.9, 0.95), (1.15, -0.6, 0.25), 55, 11)]}
 
 
 @scene
 def macro(args):
-    """A pebble half-buried in sand: low, close, shallow depth of field."""
+    """A stone half-buried in sand: low raking sun, every grain a shadow-casting bump."""
     scene = reset()
-    sky = hdri("kloofendal_43d_clear")
-    world(scene, sky, rotation_deg=sun_rotation(sky, 75), strength=1.0)
-    maps = texture("sand_01")
+    sky = hdri("rogland_sunset")
+    world(scene, sky, rotation_deg=sun_rotation(sky, 60), strength=1.0)
+    maps = texture("sand_01", "8k", disp_res="4k")
     tile = texture_size("sand_01")
-    floor = ground("Sand", 1.2, 1200, maps, tile, height=0.006,
-                   material=ground_material("Sand", maps, tile))
+    floor = ground("Sand", 1.2, 960, maps, tile, height=0.0,
+                   material=ground_material("Sand", maps, tile, shade=(0.96, 1.03), micro=0.0025))
+    micro_displace(floor)
+    apron(floor, 12, 0.02, maps, tile, height=0.0)
     stone = append_objects(model("stone_01"), rename="Stone")[0]
     place(stone, (0.0, 0.0, 0.0), (6, -10, 40), sink=0.45)
     return floor, [stone], {"cams": [
-        ("hero", (0.23, -0.31, 0.055), (0.0, 0.0, 0.012), 100, 3.5),
-        ("compare", (0.23, -0.31, 0.055), (0.0, 0.0, 0.012), 100, 3.5)]}
+        ("hero", (0.2, -0.27, 0.085), (0.0, 0.0, 0.015), 100, 16),
+        ("compare", (0.2, -0.27, 0.085), (0.0, 0.0, 0.015), 100, 16)],
+        "after_blend": lambda proxy: micro_displace(proxy)}
 
 
 TUNING = {
-    # Applied after the operator's fitted distances, as an artist would after a first look.
-    # "objects" are each object's own settings; "ground" lives on the shared ground.
-    # The fitted distances (a third of each rock's height, ~0.4 m) are right for a clean
-    # model; on these low-poly scans a band that wide shows the conformed ground sliding and
-    # its texture stretching. An artist pulls them in after a first look: the ground rises
-    # 0.25 m around the rock and only a hand's width of soil colour climbs onto it.
-    "forest": dict(objects={"Contact Distance": 0.25, "Material Blend Distance": 0.05,
-                            "Normal Blend Distance": 0.08},
-                   ground={"Contact Subdivisions": 2}, breakup=(0.6, 0.5, 6.0)),
-    # Same story on hard desert ground: the fitted 0.3-0.6 m bands smear sand halfway up the
-    # big boulders. 0.25 m keeps the front pair's bands overlapping.
-    "boulders": dict(objects={"Contact Distance": 0.25, "Material Blend Distance": 0.05,
-                              "Normal Blend Distance": 0.08},
-                     ground={"Contact Subdivisions": 2}, breakup=(0.6, 0.5, 4.0)),
-    # Normal Blend only at the contact line: at this scale the scan's ~3 mm facets are as big
-    # as the band, and in hard sun the welded (lit-looking) normals on faces the stone itself
-    # shadows rendered as dark triangular shards along the junction.
-    "macro": dict(objects={"Contact Distance": 0.012, "Material Blend Distance": 0.006,
-                           "Normal Blend Distance": 0.0005},
-                  ground={"Contact Subdivisions": 2, "Ground Detail": 0.0015, "Detail Midlevel": 0.5,
-                          "Detail UV Map": "DispUV", "Detail Image": ("sand_01", "disp")},
-                  breakup=(0.6, 0.4, 60.0)),
+    # The add-on's fitted defaults throughout (Fit Size: distances from each object's size,
+    # Edge Breakup with crevices); only the shared ground's own settings are chosen here.
+    "forest": dict(objects={}, ground={"Contact Subdivisions": 2}),
+    "boulders": dict(objects={}, ground={"Contact Subdivisions": 2}),
+    # Half the default rise: at 1:1 the sand climbed over the stone's low lobe like a pillow.
+    "macro": dict(objects={"Ground Conform": 0.5}, ground={"Contact Subdivisions": 2}),
 }
 
 
 def build(name, args):
     print(f"== {name}", flush=True)
+    t_start = time.time()
+    timings = {}
     floor, rocks, extra = SCENES[name](args)
     scene = bpy.context.scene
     cams = {}
@@ -565,31 +777,50 @@ def build(name, args):
     render_settings(scene, args.samples, preview=args.preview)
     RENDERS.mkdir(parents=True, exist_ok=True)
     suffix = "_preview" if args.preview else ""
+    out = {k: RENDERS / f"{name}_{k}{suffix}.jpg" for k in
+           ("before", "after", "hero", "compare", "wire_before", "wire_after", "wire_compare", "breakdown")}
+    timings["build_scene"] = round(time.time() - t_start, 1)
+
+    def timed(key, fn, *a):
+        t0 = time.time()
+        fn(*a)
+        timings[key] = round(time.time() - t0, 1)
+
     if not args.no_render:
-        render(scene, cams["compare"], RENDERS / f"{name}_before{suffix}.jpg", (1280, 720), 64, args.preview)
+        timed("render_before", render, scene, cams["compare"], out["before"], (1280, 720), 128, args.preview)
+        if args.wire:
+            timed("render_wire_before", render_wire, scene, cams["compare"], out["wire_before"], args.preview)
+    t0 = time.time()
     proxy = blend_into(floor, rocks)
     tuning = TUNING[name]
+    import os
+    if os.environ.get("CB_DEMO_TUNE"):            # experiments: {"objects": {...}, "ground": {...}}
+        tuning = {**tuning, **json.loads(os.environ["CB_DEMO_TUNE"])}
+    if os.environ.get("CB_DEMO_NO_MICRO") and "after_blend" in extra:
+        extra.pop("after_blend")
     for rock in rocks:
-        mod = cb.find_mod(rock)
         for socket_name, value in tuning["objects"].items():
-            assert cb.set_socket(mod, socket_name, value), socket_name
+            assert cb.set_socket(cb.find_mod(rock), socket_name, value), socket_name
         rock.update_tag()
-        breakup(rock, *tuning["breakup"])
-    ground_settings = dict(tuning["ground"])
-    if "Detail Image" in ground_settings:
-        asset, kind = ground_settings["Detail Image"]
-        ground_settings["Detail Image"] = _image(texture(asset)[kind], False)
-    tune_ground(proxy, **ground_settings)
+    tune_ground(proxy, **tuning["ground"])
+    if "after_blend" in extra:
+        extra["after_blend"](proxy)
     bpy.context.view_layer.update()
-    bpy.ops.file.pack_all()
-    blend_path = HERE / f"{name}.blend"
-    bpy.ops.wm.save_as_mainfile(filepath=str(blend_path), compress=True)
-    print(f"saved {blend_path.name}: {blend_path.stat().st_size / 1e6:.1f} MB", flush=True)
+    timings["blend_and_evaluate"] = round(time.time() - t0, 1)
     if not args.no_render:
-        after = RENDERS / f"{name}_after{suffix}.jpg"
-        render(scene, cams["compare"], after, (1280, 720), 64, args.preview)
-        render(scene, cams["hero"], RENDERS / f"{name}_hero{suffix}.jpg", (1920, 1080), args.samples, args.preview)
-        composite(RENDERS / f"{name}_before{suffix}.jpg", after, RENDERS / f"{name}_compare{suffix}.jpg")
+        timed("render_after", render, scene, cams["compare"], out["after"], (1280, 720), 128, args.preview)
+        if args.wire:
+            timed("render_wire_after", render_wire, scene, cams["compare"], out["wire_after"], args.preview)
+        timed("render_hero", render, scene, cams["hero"], out["hero"], (1920, 1080), args.samples, args.preview)
+        composite(out["before"], out["after"], out["compare"])
+        if args.wire:
+            composite(out["wire_before"], out["wire_after"], out["wire_compare"])
+            breakdown(out["before"], out["after"], out["wire_before"], out["wire_after"], out["breakdown"])
+    timings["total_to_save"] = round(time.time() - t_start, 1)
+    record(name + suffix, rocks, proxy, timings)
+    timings["blend_file_mb"] = round(save_light(name), 1) if not args.preview else None
+    record(name + suffix, rocks, proxy, timings)
+    print(f"timings {name}: {timings}", flush=True)
 
 
 def main():
@@ -598,7 +829,9 @@ def main():
     parser.add_argument("--scene", choices=sorted(SCENES), action="append")
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--preview", action="store_true")
-    parser.add_argument("--samples", type=int, default=96, help="hero image samples")
+    parser.add_argument("--samples", type=int, default=192, help="hero image samples")
+    parser.add_argument("--wire", action="store_true",
+                        help="also render the wireframe pair, its split composite and the four-up breakdown")
     args = parser.parse_args(argv)
     cb.register()
     try:

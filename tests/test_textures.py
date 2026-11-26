@@ -455,8 +455,9 @@ class TextureTests(unittest.TestCase):
         red, _, blue = pixel(0.7)
         self.assertGreater(blue, 0.99, f"top of the rock is not its own colour ({red}, {blue})")
 
-    def test_breakup_is_identity_by_default_and_never_moves_the_ends(self):
-        """Render the breakup group's output straight to emission, compared to its input."""
+    def breakup_renderer(self):
+        """A function rendering the breakup group's output straight to emission (or its input,
+        bypassing the group), returning the red channel of every pixel."""
         tree = self.source.active_material.node_tree
         tree.nodes.clear()
         emission = tree.nodes.new("ShaderNodeEmission")
@@ -500,8 +501,14 @@ class TextureTests(unittest.TestCase):
             bpy.data.images.remove(image)
             return pixels
 
-        defaults = {"Breakup": 0.0, "Sharpness": 0.0, "Noise Scale": 5.0}
-        strong = {"Breakup": 1.0, "Sharpness": 1.0, "Noise Scale": 30.0}
+        return render
+
+    def test_breakup_is_identity_by_default_and_never_moves_the_ends(self):
+        """Render the breakup group's output straight to emission, compared to its input."""
+        render = self.breakup_renderer()
+        # Crevices 0 ignores whatever cavity the object reports
+        defaults = {"Breakup": 0.0, "Sharpness": 0.0, "Crevices": 0.0, "Cavity": 0.93, "Noise Scale": 5.0}
+        strong = {"Breakup": 1.0, "Sharpness": 1.0, "Crevices": 1.0, "Cavity": 0.93, "Noise Scale": 30.0}
         with tempfile.TemporaryDirectory(prefix="contact-blend-breakup-") as tmp:
             out = pathlib.Path(tmp)
             for blend in (0.0, 0.137, 0.5, 0.91, 1.0):
@@ -514,8 +521,26 @@ class TextureTests(unittest.TestCase):
                 with self.subTest(blend=blend, settings="strong"):
                     via = render(out / "strong.exr", blend, True, **strong)
                     self.assertEqual(set(via), {blend}, "breakup moved an end of the ramp")
-            broken = render(out / "broken.exr", 0.5, True, **strong)
+            broken = render(out / "broken.exr", 0.5, True, **dict(strong, Crevices=0.0))
             self.assertGreater(max(broken) - min(broken), 0.5, "breakup does nothing mid-ramp")
+
+    def test_breakup_puts_ground_in_crevices_and_rock_on_ridges(self):
+        """A real junction is a broken edge: at the same height on the band, soil fills a
+        crevice and a ridge stands clear. Through the object's cavity (crevice 1, ridge 0)
+        the breakup must decide that sharply, not leave both at a half-and-half smear."""
+        render = self.breakup_renderer()
+        sharp = {"Breakup": 0.0, "Sharpness": 1.0, "Crevices": 1.0, "Noise Scale": 5.0}
+        with tempfile.TemporaryDirectory(prefix="contact-blend-crevices-") as tmp:
+            out = pathlib.Path(tmp)
+            for blend in (0.35, 0.5, 0.65):
+                with self.subTest(blend=blend):
+                    crevice = render(out / "crevice.exr", blend, True, Cavity=0.9, **sharp)
+                    ridge = render(out / "ridge.exr", blend, True, Cavity=0.1, **sharp)
+                    self.assertEqual(set(crevice), {1.0}, "ground did not win in the crevice")
+                    self.assertEqual(set(ridge), {0.0}, "rock did not win on the ridge")
+            # flat surface (cavity 0.5): the edge sits where the ramp crosses the middle
+            self.assertEqual(set(render(out / "flat.exr", 0.4, True, Cavity=0.5, **sharp)), {0.0})
+            self.assertEqual(set(render(out / "flat.exr", 0.6, True, Cavity=0.5, **sharp)), {1.0})
 
 
 if __name__ == "__main__":
