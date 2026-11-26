@@ -18,43 +18,61 @@ objects can sit on one ground: they all crater the same surface.
 
 Three scenes built from real scanned [Poly Haven](https://polyhaven.com) assets (CC0, see
 [demo/CREDITS.md](demo/CREDITS.md)), each blended with the add-on's own operators exactly as an
-artist would: pick the ground, select the objects, press **Contact Blend**, then adjust a few
-settings. Left half without the add-on, right half with it, from the same camera:
+artist would: pick the ground, select the objects, press **Contact Blend**. Every object keeps the
+distances and Edge Breakup the add-on fitted to it; only the macro stone has one setting changed
+(Ground Conform 0.5). Left half without the add-on, right half with it, from the same camera:
 
-**Forest floor:** two mossy boulders settled into soil and needles.
+**Forest floor:** mossy rocks, pine roots and a fallen branch settled into a leaf-littered floor,
+low warm sun through young firs and pines, seen from a crouch.
 
 ![Forest floor, before and after](demo/renders/forest_compare.jpg)
 
-**Boulders:** five granite boulders of very different sizes on dry, stony ground; the two at the
-front overlap each other's contact bands.
+**Boulders:** five granite boulders of very different sizes and four small rocks on gravelly sand
+under a sunrise sun; the two at the front overlap each other's contact bands.
 
 ![Boulders, before and after](demo/renders/boulders_compare.jpg)
 
-**Macro:** a 15 cm stone half-buried in sand, with Edge Breakup and Ground Detail.
+**Macro:** a 15 cm stone half-buried in sand under a low sun, the grains true micro-displacement.
 
 ![Macro, before and after](demo/renders/macro_compare.jpg)
 
-Full-size renders are in [demo/renders](demo/renders) (`<scene>_hero.jpg`, `<scene>_before.jpg`,
-`<scene>_after.jpg`). To rebuild them, run the script with Blender 5.x (or a `bpy` wheel). It
-downloads the assets into `demo/assets/` (git-ignored), builds each scene, saves
-`demo/<scene>.blend` with its textures packed, and renders:
+Each scene also has a wireframe pair from the same camera — the conformed, subdivided contact
+island and the junction topology the renders hide — and a four-up breakdown:
+
+![Forest floor breakdown](demo/renders/forest_breakdown.jpg)
+
+Everything is in [demo/renders](demo/renders): `<scene>_hero.jpg` (1920×1080),
+`<scene>_before.jpg` / `_after.jpg` / `_compare.jpg`, `<scene>_wire_before.jpg` / `_wire_after.jpg`
+/ `_wire_compare.jpg`, `<scene>_breakdown.jpg`, and `<scene>.json` with every setting each blend
+used and the measured timings. To rebuild them, run the script with Blender 5.x (or a `bpy`
+wheel). It downloads the assets into `demo/assets/` (git-ignored), builds each scene, renders, and
+saves `demo/<scene>.blend`:
 
 ```bash
-blender -b -P demo/build_demos.py                       # all three scenes, full quality
-blender -b -P demo/build_demos.py -- --scene macro      # one scene
-blender -b -P demo/build_demos.py -- --no-render        # build and save the .blend files only
-blender -b -P demo/build_demos.py -- --preview          # quick 640x360 renders, *_preview.jpg
+blender -b -P demo/build_demos.py -- --wire               # all three scenes, full quality, wireframes too
+blender -b -P demo/build_demos.py -- --scene macro        # one scene
+blender -b -P demo/build_demos.py -- --no-render          # build and save the .blend files only
+blender -b -P demo/build_demos.py -- --preview --wire     # quick 640x360 renders, *_preview.jpg
+blender -b -P demo/build_demos.py -- --credits            # rebuild CREDITS.md from what the scenes use
 ```
 
-Rendering is Cycles on the CPU. A full run takes a long time on a laptop; `--samples N` sets the
-hero image's samples (default 96). With textures packed, `demo/forest.blend` and
-`demo/macro.blend` are about 35 and 40 MB; `demo/boulders.blend` (five full-resolution scans) is
-about 130 MB and git-ignored, so build it with `-- --scene boulders --no-render`.
+Rendering is Cycles on the CPU with OpenImageDenoise; `--samples N` sets the hero image's samples
+(default 192). The saved `.blend` files pack every texture as a JPEG of at most 1024 pixels, so they
+open anywhere but are not for re-rendering the heroes at full quality — run the script for that.
+`demo/macro.blend` (about 24 MB) is in the repository; the forest and boulders scenes, dressed
+with dozens of full-resolution scans, are larger than the 45 MB it keeps, so build those with
+`-- --scene forest --no-render` (or `boulders`).
 
 ## Install
 
-1. Download `contact_blend.py`.
-2. `Edit > Preferences > Add-ons > Install from Disk…`, pick the file, enable it.
+**As an extension (recommended):** download [`dist/contact_blend-2.0.0.zip`](dist/contact_blend-2.0.0.zip)
+and drag it into the Blender window, or use `Edit > Preferences > Get Extensions > Install from Disk…`.
+
+**As a single file:** download `contact_blend.py`, then `Edit > Preferences > Add-ons > Install from
+Disk…`, pick the file and enable it.
+
+The zip is built from `contact_blend.py` by `python tools/build_dist.py`. There is also a product
+page with interactive before/after and wireframe comparisons in [docs/index.html](docs/index.html).
 
 The add-on builds two Geometry Nodes groups on first use, `Contact Blend` (on each object) and
 `Contact Blend Ground` (on the shared ground), and stamps both with a version. Later releases
@@ -129,11 +147,16 @@ object-linked copy, so other objects sharing the material or the mesh are untouc
 **active** material is used; when the ground has several, the sidebar says which. Slots without a
 usable node material are skipped.
 
-**Edge Breakup** (in the Shading section) roughens the cross-fade, which is otherwise a smooth
-airbrushed band. *Breakup* sets the strength, *Sharpness* hardens the edge and *Noise Scale* sets the
-size of the noise, which is in the object's own space. At the defaults (0) the blend is unchanged,
-and at any setting the material stays fully the object's away from the contact and fully the
-ground's at it — no speckles, no holes.
+**Edge Breakup** (in the Shading section) turns the cross-fade, which would otherwise be a smooth
+airbrushed band of stretched ground texture, into the broken edge a real junction has: ground
+material wins in the object's crevices and low pockets, the rock wins on its ridges. *Crevices*
+sets how strongly the object's own cavities (measured per point by the modifier, so it works in
+EEVEE as well as Cycles) pull the ground material in, *Breakup* adds noise, *Sharpness* hardens the
+edge and *Noise Scale* sets the size of the noise, which is in the object's own space. A new blend
+starts fitted to the object (Breakup 0.5, Sharpness 0.75, Crevices 0.8, noise features about ⅔ of
+Contact Distance across; **Fit Size** re-applies them). At 0 the blend is unchanged — materials from
+earlier releases keep that until you turn it up — and at any setting the material stays fully the
+object's away from the contact and fully the ground's at it: no speckles, no holes.
 
 ### Update, Fit and Remove
 
@@ -210,10 +233,10 @@ its average).
 | Setting | New blend | What it does |
 |---|---|---|
 | **Normal Blend** | ⅔ of Contact Distance | Over what distance the object's shading normals rotate to match the ground's. |
-| **Material Blend** | = Contact Distance | Over what distance, measured from where the object meets the ground, its material fades into the ground's. |
+| **Material Blend** | ½ Contact Distance | Over what distance, measured from where the object meets the ground, its material fades into the ground's. |
 | **Match Target Textures** | on | Match UV, Object, and Generated coordinates in the copied ground shader. |
 | **Target UV Map** | ground's render UV | UV map to project onto the object. |
-| **Breakup / Sharpness / Noise Scale** | 0 / 0 / 5 | Edge breakup of the material cross-fade, stored on the material. |
+| **Breakup / Sharpness / Crevices / Noise Scale** | 0.5 / 0.75 / 0.8 / fitted | Edge breakup of the material cross-fade, stored on the material (see Edge Breakup). |
 
 **Ground** — shared by every object on the ground
 
@@ -227,9 +250,10 @@ its average).
 | **Detail Midlevel** | 0.0 | Value that means "no displacement". Set **0.5** for a real height map; the 0 default makes an unset image a no-op. |
 
 Contact Distance, Surface Offset and the blend distances are fitted to the object's size when a
-blend is created (⅓ of its smaller horizontal side or its height, whichever is less, clamped to
-1 mm–50 m, so a low boulder or a paving slab is not covered in ground colour to its top), and **Fit Size** re-applies
-that on demand.
+blend is created (⅓ of its smaller horizontal side or of the height that shows above the ground,
+whichever is less, clamped to 1 mm–50 m, so a low boulder, a half-buried stone or a paving slab is
+not swallowed by its own meniscus or covered in ground colour to its top), and **Fit Size**
+re-applies that on demand.
 
 **Hazards.** The sidebar warns, with a one-click fix where there is one, when the original ground
 still renders, when the shared ground is hidden or missing, when Ground Conform is ~0, and when the
@@ -253,14 +277,23 @@ ground's material displaces at render time. **Diagnose** writes a full report to
   put in separate *overlap groups*, worked out automatically and kept current as you move them;
   the cost grows with the number of groups, not the number of objects.
 - **Shading is welded.** Near the contact each object adopts the ground's normals over Normal Blend
-  distance, written on the corner domain so sharp edges elsewhere survive. To have a ground to weld
+  distance, written on the corner domain so sharp edges elsewhere survive. A normal is never bent
+  towards a direction the object itself blocks (under an overhang, in a crevice): there a face the
+  object shadows would shade as lit up to the shadow's edge, which on a coarse scan in low sun
+  showed as hard dark shards along the junction. To have a ground to weld
   to, each object conforms the small patch of ground it can see, with the same settings the shared
   ground uses, and samples normals and UVs from it.
 - **Materials cross-fade.** A `blend` attribute is stored per point: 1 where the object meets the
   ground *as drawn* — the conformed ground, whose meniscus has climbed the object's flank — and 0
   at Material Blend distance above it. (With Displace Ground off it is measured against the
   original.) The ground's shader tree is copied into each of the object's materials and mixed
-  against it by that attribute, through the Edge Breakup node.
+  against it by that attribute, through the Edge Breakup node, which also reads the object's
+  `cb_cavity` (crevice or ridge, per point) to break the edge up.
+- **The ground's texture keeps its scale.** The conform slides ground vertices towards the object
+  and up its flank; carried along, their UVs squeezed the ground's texture into fans and stretched
+  it up the meniscus. Moved vertices instead read the ground's own mapping where they now are,
+  continued up the climb as if it were folded flat, so the texture stays at its real size and meets
+  the untouched ground without a seam.
 - **Subdivision cannot crack.** Only faces that can come within reach of an object are subdivided,
   by a conservative per-face bound, so every vertex on the cut — including those subdivision adds —
   provably stays put. Detail displacement is masked by the same falloff.
@@ -307,8 +340,8 @@ blender --background --python-exit-code 1 --python tests/test_shared.py
 ```
 
 ```
-OK  hero_moved=0.000000  ground dip=-0.0692 far=0.000000 subdiv=1681->7081  detail=0.2696
-    blend=0.000..0.984  bent=320/1536  ground=6601
+OK  hero_moved=0.000000  ground dip=-0.0656 far=0.000000 subdiv=1681->6601  detail=0.2696
+    blend=0.000..0.926  bent=320/1536  ground=6601
 ```
 
 The self-test covers: the object's mesh is never deformed and carries only itself, flat shading
@@ -321,14 +354,17 @@ without losing settings, and a file saved under the 1.0 name migrates without or
 - `tests/test_workflow.py` — shared materials and linked meshes, repeated application and refresh,
   user shader edits, retargeting, per-view-layer visibility, legacy removal, save/reload, node-state
   fidelity of copied shaders, every material slot, edge breakup, appended/linked groups found by
-  stamp, grounds outside the view layer, and fitted distances (capped by the object's height).
+  stamp, grounds outside the view layer, and fitted distances (capped by the height that shows above
+  the ground) and fitted Edge Breakup.
 - `tests/test_textures.py` — transformed grounds, UV sampling after conforming (shared and joined),
   private shader groups, disabled matching, small CPU Cycles renders against the original ground
-  pattern, the breakup node's identity and end-point guarantees, the ground colour reaching the
-  visible junction, and ground UVs keeping their scale up a vertical flank instead of streaking.
+  pattern, the breakup node's identity and end-point guarantees, ground material winning in
+  crevices and rock on ridges, the ground colour reaching the visible junction, and ground UVs
+  keeping their scale up a vertical flank instead of streaking.
 - `tests/test_geometry.py` — coarse grounds, the crack-free cut, welding on curved grounds, Displace
   Ground off, world-metre distances under object scale, instanced grounds, `blend` measured against
-  the ground as drawn, and welded normals that never collapse; every test runs on both the shared
+  the ground as drawn, welded normals that never collapse and never bend towards what the object
+  itself blocks, and the cavity attribute marking crevices and ridges; every test runs on both the shared
   ground and a legacy joined copy.
 - `tests/test_shared.py` — two and five objects on one ground, per-object Contact Distance, a
   moving/scaled/rotated ground, removal, duplication, a deleted shared ground, ground settings,
@@ -337,8 +373,9 @@ without losing settings, and a file saved under the 1.0 name migrates without or
   (`tests/fixtures/joined_v7.blend`, written by that release) upgrading and converting cleanly,
   overlapping contact bands (same and very different sizes, touching, interpenetrating: no folds,
   no slivers, continuous under a tiny move, exactly the single-object result when bands do not
-  meet), regrouping on a move, and a rough scan-like rock that must neither crumple the ground nor shred
-  the ground's texture continued up its flank.
+  meet), regrouping on a move, a rough scan-like rock that must neither crumple the ground nor shred
+  the ground's texture continued up its flank, and the ground's own texture keeping its scale in
+  the contact band instead of being squeezed into fans.
 
 For a headless environment with the official `bpy` package installed, the same checks run directly
 with that Python interpreter:

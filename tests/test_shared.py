@@ -502,6 +502,49 @@ class RoughObjectTests(SharedBase):
         self.assertGreater(visible_folds(), 10, "the test is not biting: no folds without smoothing")
 
 
+class MeniscusTextureTests(SharedBase):
+    def test_ground_texture_keeps_its_scale_in_the_contact_band(self):
+        """The conform carries each ground vertex's UVs with it, sliding it towards the object
+        and up its flank, so the ground's texture was squeezed into radial fans and stretched
+        into streaks around every junction of the demos. In the contact band the ground's UVs
+        must change at the ground's real rate (8 m grid: 1/8 per metre)."""
+        import numpy as np
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.03, 0.02, 0.2))
+        rock = bpy.context.object
+        bpy.ops.object.modifier_add(type="SUBSURF")
+        rock.modifiers[0].subdivision_type = "SIMPLE"
+        rock.modifiers[0].levels = 4
+        bpy.ops.object.modifier_apply(modifier=rock.modifiers[0].name)
+        self.material(rock, "Rock")
+        proxy = self.blend(rock)
+        mod = cb.find_mod(rock)
+        cb.set_socket(mod, "Contact Distance", 0.35)
+        rock.update_tag()
+        proxy.update_tag()
+        bpy.context.view_layer.update()
+        me, co = self.ground_points()
+        uv = me.uv_layers["UVMap"].data
+        at = {}
+        for loop in me.loops:
+            at.setdefault(loop.vertex_index, uv[loop.index].uv.copy())
+        rates = []
+        centre = rock.matrix_world.translation
+        for e in me.edges:
+            a, b = e.vertices
+            d = co[b] - co[a]
+            if d.length < 1e-6:
+                continue
+            mid = (co[a] + co[b]) / 2
+            gap = max(abs(mid.x - centre.x), abs(mid.y - centre.y)) - 0.5     # outside the box's wall
+            if 0.0 < gap < 0.3 and mid.z > -0.05:                              # in its contact band
+                rates.append((at[b] - at[a]).length / d.length / (1 / 8))
+        self.assertGreater(len(rates), 30, "no contact band; the test is not biting")
+        low, high = np.percentile(rates, [10, 99])
+        # carried along, the old UVs ranged from 0.6x (stretched) to 4.5x (squeezed into fans)
+        self.assertGreater(low, 0.9, f"ground texture stretched in the contact band: {low:.2f}x its scale")
+        self.assertLess(high, 1.15, f"ground texture squeezed in the contact band: {high:.2f}x its scale")
+
+
 class ResolutionTests(SharedBase):
     def test_resolution_rules_and_labels(self):
         rock, pebble, stone = self.rock("Rock", -2, 0), self.rock("Pebble", 0, 0), self.rock("Stone", 2, 0)

@@ -1,0 +1,55 @@
+{
+  "objects": {
+    "Stone": {
+      "settings": {
+        "Target": "Sand",
+        "Contact Distance": 0.0158,
+        "Surface Offset": 0.00019,
+        "Displace Ground": true,
+        "Ground Conform": 0.5,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.010533,
+        "Material Blend Distance": 0.0079,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 0,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "stone_01.001 (Contact Blend)": {
+          "Noise Scale": 94.938759,
+          "Breakup": 0.5,
+          "Sharpness": 0.35,
+          "Crevices": 0.5
+        }
+      }
+    }
+  },
+  "ground": {
+    "Target": "Sand",
+    "Objects": "Sand \u00b7 Contact Blend Objects",
+    "Contact Subdivisions": 2,
+    "Ground Detail": 0.0,
+    "Detail UV Map": "UVMap",
+    "Detail Midlevel": 0.0,
+    "Contact Smoothing": 8,
+    "Target Material": "Sand",
+    "Ground Material": "Sand (Contact Blend Ground)",
+    "UV Map": "UVMap"
+  },
+  "timings_s": {
+    "build_scene": 2.9,
+    "render_before": 121.6,
+    "render_wire_before": 30.4,
+    "blend_and_evaluate": 26.3,
+    "render_after": 165.7,
+    "render_wire_after": 53.1,
+    "render_hero": 492.8,
+    "total_to_save": 892.9,
+    "blend_file_mb": 23.6
+  }
+}

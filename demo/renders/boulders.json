@@ -1,0 +1,279 @@
+{
+  "objects": {
+    "Boulder 1": {
+      "settings": {
+        "Target": "Gravelly sand",
+        "Contact Distance": 0.386764,
+        "Surface Offset": 0.004641,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.257843,
+        "Material Blend Distance": 0.193382,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 1,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "namaqualand_boulder_03.001 (Contact Blend)": {
+          "Noise Scale": 3.878334,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Boulder 2": {
+      "settings": {
+        "Target": "Gravelly sand",
+        "Contact Distance": 0.138244,
+        "Surface Offset": 0.001659,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.092163,
+        "Material Blend Distance": 0.069122,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 0,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "namaqualand_boulder_05.001 (Contact Blend)": {
+          "Noise Scale": 10.850377,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Boulder 3": {
+      "settings": {
+        "Target": "Gravelly sand",
+        "Contact Distance": 0.47875,
+        "Surface Offset": 0.005745,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.319167,
+        "Material Blend Distance": 0.239375,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 0,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "namaqualand_boulder_04.001 (Contact Blend)": {
+          "Noise Scale": 3.133159,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Boulder 4": {
+      "settings": {
+        "Target": "Gravelly sand",
+        "Contact Distance": 0.155717,
+        "Surface Offset": 0.001869,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.103811,
+        "Material Blend Distance": 0.077859,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 0,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "namaqualand_boulder_06.001 (Contact Blend)": {
+          "Noise Scale": 9.632853,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Boulder 5": {
+      "settings": {
+        "Target": "Gravelly sand",
+        "Contact Distance": 0.209544,
+        "Surface Offset": 0.002515,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.139696,
+        "Material Blend Distance": 0.104772,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 2,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "namaqualand_boulder_02.001 (Contact Blend)": {
+          "Noise Scale": 7.158386,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Small rock 1": {
+      "settings": {
+        "Target": "Gravelly sand",
+        "Contact Distance": 0.042321,
+        "Surface Offset": 0.000508,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.028214,
+        "Material Blend Distance": 0.021161,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 2,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "namaqualand_rocks_01.001 (Contact Blend)": {
+          "Noise Scale": 47.347206,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Small rock 2": {
+      "settings": {
+        "Target": "Gravelly sand",
+        "Contact Distance": 0.029207,
+        "Surface Offset": 0.00035,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.019471,
+        "Material Blend Distance": 0.014603,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 3,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "namaqualand_rocks_01.001 (Contact Blend).001": {
+          "Noise Scale": 65.707138,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Small rock 3": {
+      "settings": {
+        "Target": "Gravelly sand",
+        "Contact Distance": 0.029944,
+        "Surface Offset": 0.000359,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.019963,
+        "Material Blend Distance": 0.014972,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 2,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "namaqualand_rocks_01.001 (Contact Blend).002": {
+          "Noise Scale": 67.746895,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Small rock 4": {
+      "settings": {
+        "Target": "Gravelly sand",
+        "Contact Distance": 0.050223,
+        "Surface Offset": 0.000603,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.033482,
+        "Material Blend Distance": 0.025111,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 0,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "namaqualand_rocks_01.001 (Contact Blend).003": {
+          "Noise Scale": 39.040363,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    }
+  },
+  "ground": {
+    "Target": "Gravelly sand",
+    "Objects": "Gravelly sand \u00b7 Contact Blend Objects",
+    "Contact Subdivisions": 2,
+    "Ground Detail": 0.0,
+    "Detail UV Map": "UVMap",
+    "Detail Midlevel": 0.0,
+    "Contact Smoothing": 8,
+    "Target Material": "Gravelly sand",
+    "Ground Material": "Gravelly sand (Contact Blend Ground)",
+    "UV Map": "UVMap"
+  },
+  "timings_s": {
+    "build_scene": 12.9,
+    "render_before": 187.9,
+    "render_wire_before": 61.2,
+    "blend_and_evaluate": 711.6,
+    "render_after": 356.6,
+    "render_wire_after": 244.1,
+    "render_hero": 570.8,
+    "total_to_save": 2145.5,
+    "blend_file_mb": 214.3
+  }
+}
