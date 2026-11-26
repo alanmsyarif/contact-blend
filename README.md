@@ -65,8 +65,14 @@ with dozens of full-resolution scans, are larger than the 45 MB it keeps, so bui
 
 ## Install
 
-1. Download `contact_blend.py`.
-2. `Edit > Preferences > Add-ons > Install from Disk…`, pick the file, enable it.
+**As an extension (recommended):** download [`dist/contact_blend-2.0.0.zip`](dist/contact_blend-2.0.0.zip)
+and drag it into the Blender window, or use `Edit > Preferences > Get Extensions > Install from Disk…`.
+
+**As a single file:** download `contact_blend.py`, then `Edit > Preferences > Add-ons > Install from
+Disk…`, pick the file and enable it.
+
+The zip is built from `contact_blend.py` by `python tools/build_dist.py`. There is also a product
+page with interactive before/after and wireframe comparisons in [docs/index.html](docs/index.html).
 
 The add-on builds two Geometry Nodes groups on first use, `Contact Blend` (on each object) and
 `Contact Blend Ground` (on the shared ground), and stamps both with a version. Later releases

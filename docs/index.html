@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Contact Blend — sink objects into a ground without booleans</title>
+<meta name="description" content="A Blender 5 add-on that conforms the ground to your objects, welds the shading and cross-fades the material at every contact. Non-destructive, animatable, no booleans.">
+<style>
+:root{
+  --bg:#f4f1ea; --panel:#ffffff; --ink:#1d1b18; --muted:#6b655c; --line:#ddd6c9;
+  --accent:#b4532a; --accent-ink:#ffffff; --code:#ece7dc; --shadow:0 1px 2px rgba(40,30,20,.06),0 12px 32px rgba(40,30,20,.08);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#15130f; --panel:#1e1b16; --ink:#efe9dd; --muted:#a39a8b; --line:#342f27;
+    --accent:#e0794a; --accent-ink:#1a1206; --code:#28241d; --shadow:0 1px 2px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.35);
+  }
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:17px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  -webkit-font-smoothing:antialiased}
+img{max-width:100%;height:auto;display:block}
+a{color:var(--accent)}
+code,kbd{font:0.88em ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code);padding:.12em .4em;border-radius:4px}
+.wrap{max-width:1120px;margin:0 auto;padding:0 20px}
+header.top{display:flex;align-items:center;justify-content:space-between;padding:18px 0;gap:16px}
+.brand{font-weight:700;letter-spacing:-.01em;text-decoration:none;color:var(--ink)}
+nav a{color:var(--muted);text-decoration:none;margin-left:20px;font-size:15px}
+nav a:hover{color:var(--ink)}
+.hero{padding:28px 0 8px}
+.eyebrow{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:600}
+h1{font-size:clamp(34px,6vw,62px);line-height:1.04;letter-spacing:-.03em;margin:.25em 0 .35em;max-width:16ch;
+  font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;font-weight:600}
+.lede{font-size:clamp(18px,2.2vw,21px);color:var(--muted);max-width:62ch;margin:0 0 26px}
+.cta{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:34px}
+.btn{display:inline-block;background:var(--accent);color:var(--accent-ink);text-decoration:none;font-weight:600;
+  padding:12px 20px;border-radius:10px}
+.btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+.meta{font-size:14px;color:var(--muted)}
+.shot{border-radius:14px;overflow:hidden;box-shadow:var(--shadow);background:#000}
+section{padding:64px 0 0}
+h2{font-size:clamp(26px,3.6vw,38px);letter-spacing:-.02em;line-height:1.15;margin:0 0 .4em;
+  font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;font-weight:600}
+.sub{color:var(--muted);max-width:66ch;margin:0 0 28px}
+.grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+.card h3{margin:0 0 .35em;font-size:18px;letter-spacing:-.01em}
+.card p{margin:0;color:var(--muted);font-size:15.5px}
+
+/* comparison slider */
+.cmp{margin:0 0 44px}
+.cmp-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:12px}
+.cmp-head h3{margin:0;font-size:21px}
+.cmp-head p{margin:0;color:var(--muted);font-size:15px;flex:1 1 320px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--panel)}
+.seg button{font:inherit;font-size:14px;padding:7px 14px;border:0;background:transparent;color:var(--muted);cursor:pointer}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
+.stage{position:relative;aspect-ratio:16/9;border-radius:14px;overflow:hidden;box-shadow:var(--shadow);background:#111;
+  touch-action:pan-y;user-select:none;-webkit-user-select:none;--x:50%}
+.stage img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none}
+.stage .after{clip-path:inset(0 0 0 var(--x))}
+.stage .bar{position:absolute;top:0;bottom:0;left:var(--x);width:2px;margin-left:-1px;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.25)}
+.stage .knob{position:absolute;top:50%;left:var(--x);width:40px;height:40px;margin:-20px 0 0 -20px;border-radius:50%;
+  background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.4);display:grid;place-items:center;color:#222;font-size:15px}
+.stage .tag{position:absolute;bottom:12px;font-size:12.5px;letter-spacing:.04em;background:rgba(0,0,0,.55);color:#fff;padding:4px 9px;border-radius:6px}
+.stage .tag.l{left:12px}.stage .tag.r{right:12px}
+.stage input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:ew-resize;margin:0}
+.stage:focus-within .knob{outline:3px solid var(--accent);outline-offset:2px}
+.settings{font-size:14px;color:var(--muted);margin-top:10px}
+
+ol.steps{counter-reset:s;list-style:none;padding:0;margin:0;display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}
+ol.steps li{counter-increment:s;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 22px 22px 64px;position:relative}
+ol.steps li::before{content:counter(s);position:absolute;left:20px;top:20px;width:30px;height:30px;border-radius:50%;
+  background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font-weight:700;font-size:15px}
+ol.steps b{display:block;margin-bottom:.2em}
+ol.steps span{color:var(--muted);font-size:15.5px}
+
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:15.5px;min-width:520px}
+th,td{text-align:left;padding:12px 16px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}
+th{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600}
+td.n{font-variant-numeric:tabular-nums;white-space:nowrap}
+ul.plain{padding-left:1.1em;margin:0}
+ul.plain li{margin:.45em 0;color:var(--muted)}
+ul.plain li b{color:var(--ink)}
+.two{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+pre{background:var(--code);padding:16px 18px;border-radius:12px;overflow-x:auto;font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:0}
+footer{margin:72px 0 0;padding:28px 0 48px;border-top:1px solid var(--line);color:var(--muted);font-size:14.5px}
+@media (max-width:640px){nav a:not(.keep){display:none}.wrap{padding:0 16px}section{padding-top:48px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <a class="brand" href="#">Contact Blend</a>
+  <nav>
+    <a href="#compare">Before / after</a>
+    <a href="#how">How it works</a>
+    <a href="#settings">Settings</a>
+    <a href="#limits">Limits</a>
+    <a class="keep" href="#install">Install</a>
+  </nav>
+</header>
+
+<div class="hero">
+  <div class="eyebrow">Blender 5 add-on · version 2.0</div>
+  <h1>Objects that sit in the ground, not on it.</h1>
+  <p class="lede">Contact Blend sinks rocks, roots and props into a terrain without booleans. Instead of cutting
+  your objects, it bends the <em>ground</em> up to meet them, welds the shading across the junction and lets the
+  ground's material creep into the crevices. Nothing is destructive, and everything follows when you move or animate.</p>
+  <div class="cta">
+    <a class="btn" href="../dist/contact_blend-2.0.0.zip" download>Download contact_blend-2.0.0.zip</a>
+    <a class="btn ghost" href="#install">How to install</a>
+    <span class="meta">52 KB · Apache-2.0 · EEVEE and Cycles</span>
+  </div>
+  <div class="shot"><img src="../demo/renders/forest_hero.jpg" width="1920" height="1080"
+    alt="Mossy boulders, pine roots and a fallen branch settled into a leaf-littered forest floor in low warm sunlight"></div>
+  <p class="meta" style="margin-top:10px">Forest floor demo: Poly Haven CC0 scans, blended with the add-on's fitted defaults. Cycles, 192 samples.</p>
+</div>
+
+<section id="why">
+  <h2>What it does for you</h2>
+  <p class="sub">The hard line where a scanned rock pokes through a terrain is one of the quickest ways a render gives itself away. Contact Blend removes that line in three layers.</p>
+  <div class="grid">
+    <div class="card"><h3>The ground moves, not the object</h3><p>The terrain craters under each object and rides up its flanks as a small meniscus, so there is no intersection curve left to read as a seam. Your object's mesh is never touched.</p></div>
+    <div class="card"><h3>Shading is welded</h3><p>Normals blend across the contact band, and fade out wherever the object would shadow itself, so coarse scans do not grow shadow shards in hard sun.</p></div>
+    <div class="card"><h3>Material settles in the crevices</h3><p>The ground's own shader is mixed into the object along a broken edge: soil in the cavities, rock on the ridges, at the ground's true texture scale.</p></div>
+    <div class="card"><h3>Many objects, one ground</h3><p>Every object on a terrain craters the same shared surface. Neighbours whose contact bands overlap blend into one continuous field instead of fighting each other.</p></div>
+    <div class="card"><h3>Sized for you</h3><p>Contact, normal and material distances are fitted to what shows of each object above the ground, so a pebble and a boulder each get a sensible band without tuning.</p></div>
+    <div class="card"><h3>Stays live</h3><p>It is a Geometry Nodes modifier. Move, rotate, scale, duplicate or animate and the contact follows. Remove it and your scene is exactly as it was.</p></div>
+  </div>
+</section>
+
+<section id="compare">
+  <h2>Before and after, same camera</h2>
+  <p class="sub">Drag the handle. Switch to <b>Wireframe</b> to see what the add-on actually does to the ground: a subdivided contact island pulled up to each object, and untouched topology everywhere else.</p>
+
+  <div class="cmp" data-scene="forest">
+    <div class="cmp-head">
+      <h3>Forest floor</h3>
+      <p>Mossy rocks, pine roots and a fallen branch on leaf litter, low sun through young firs.</p>
+      <div class="seg" role="group" aria-label="View"><button aria-pressed="true" data-mode="">Render</button><button aria-pressed="false" data-mode="wire_">Wireframe</button></div>
+    </div>
+    <div class="stage">
+      <img class="before" src="../demo/renders/forest_before.jpg" alt="Forest scene without Contact Blend">
+      <img class="after" src="../demo/renders/forest_after.jpg" alt="Forest scene with Contact Blend">
+      <div class="bar"></div><div class="knob" aria-hidden="true">⇆</div>
+      <span class="tag l">without</span><span class="tag r">with Contact Blend</span>
+      <input type="range" min="0" max="100" value="50" aria-label="Forest floor comparison position">
+    </div>
+    <p class="settings">Fitted defaults on all five blended objects. Contact Distance 0.03–0.31 m, Material Blend half of that. Blend and evaluate: 86 s for the whole scene.</p>
+  </div>
+
+  <div class="cmp" data-scene="boulders">
+    <div class="cmp-head">
+      <h3>Boulders</h3>
+      <p>Five granite boulders and four small rocks on gravelly sand at sunrise; the two in front overlap each other's contact bands.</p>
+      <div class="seg" role="group" aria-label="View"><button aria-pressed="true" data-mode="">Render</button><button aria-pressed="false" data-mode="wire_">Wireframe</button></div>
+    </div>
+    <div class="stage">
+      <img class="before" src="../demo/renders/boulders_before.jpg" alt="Boulders scene without Contact Blend">
+      <img class="after" src="../demo/renders/boulders_after.jpg" alt="Boulders scene with Contact Blend">
+      <div class="bar"></div><div class="knob" aria-hidden="true">⇆</div>
+      <span class="tag l">without</span><span class="tag r">with Contact Blend</span>
+      <input type="range" min="0" max="100" value="50" aria-label="Boulders comparison position">
+    </div>
+    <p class="settings">Fitted defaults on all nine objects. Contact Distance 0.03–0.48 m. Blend and evaluate: 712 s on a 4-core CPU, the heaviest of the three.</p>
+  </div>
+
+  <div class="cmp" data-scene="macro">
+    <div class="cmp-head">
+      <h3>Macro</h3>
+      <p>A 15 cm stone half-buried in micro-displaced sand under a raking sun.</p>
+      <div class="seg" role="group" aria-label="View"><button aria-pressed="true" data-mode="">Render</button><button aria-pressed="false" data-mode="wire_">Wireframe</button></div>
+    </div>
+    <div class="stage">
+      <img class="before" src="../demo/renders/macro_before.jpg" alt="Macro scene without Contact Blend">
+      <img class="after" src="../demo/renders/macro_after.jpg" alt="Macro scene with Contact Blend">
+      <div class="bar"></div><div class="knob" aria-hidden="true">⇆</div>
+      <span class="tag l">without</span><span class="tag r">with Contact Blend</span>
+      <input type="range" min="0" max="100" value="50" aria-label="Macro comparison position">
+    </div>
+    <p class="settings">Contact Distance 15.8 mm, Material Blend 7.9 mm, Normal Blend 10.5 mm. Hand-set: Ground Conform 0.5, edge Sharpness 0.35, Crevices 0.5. Blend and evaluate: 26 s.</p>
+  </div>
+
+  <h3 style="margin:8px 0 12px">Four-up breakdown</h3>
+  <div class="shot"><img loading="lazy" src="../demo/renders/boulders_breakdown.jpg" width="1920" height="1080"
+    alt="Boulders scene: render without and with Contact Blend above, wireframe without and with below"></div>
+  <p class="meta" style="margin-top:10px">Each scene has a <code>_breakdown.jpg</code>, split <code>_compare.jpg</code> and <code>_wire_compare.jpg</code> in <a href="../demo/renders/">demo/renders</a>, plus a <code>.json</code> with every setting used and the measured timings.</p>
+</section>
+
+<section id="use">
+  <h2>Three clicks</h2>
+  <ol class="steps">
+    <li><b>Pick the ground</b><span>Select the terrain, then shift-select the object so it is active. For many objects, set the ground in the sidebar's <b>Ground</b> field and select them all.</span></li>
+    <li><b>Press Contact Blend</b><span>In the sidebar's <b>Contact</b> tab (<kbd>N</kbd>) or <code>Object &gt; Contact Blend</code>. The button always says what it is about to do, and why not when it cannot.</span></li>
+    <li><b>Adjust if you want to</b><span>Distances are already fitted. Nudge Contact Distance, Ground Conform or the edge breakup per object; ground-wide settings live on the shared ground.</span></li>
+  </ol>
+</section>
+
+<section id="how">
+  <h2>How it works</h2>
+  <div class="two">
+    <div class="card"><h3>A shared ground</h3>
+      <p>The original terrain is hidden and a stand-in named <code>&lt;Ground&gt; · Contact Blend</code> draws it conformed to every object blended into it. It is parented to the original, so it follows it. Only faces near a contact are subdivided and moved; the cut is frozen so the surface cannot crack.</p></div>
+    <div class="card"><h3>A modifier per object</h3>
+      <p>Each object carries a <code>Contact Blend</code> modifier that publishes its contact band to the ground, welds its normals, and writes two attributes for the shader: <code>blend</code> (distance to the ground as drawn) and <code>cb_cavity</code> (crevice or ridge).</p></div>
+    <div class="card"><h3>A private material copy</h3>
+      <p>Every node-material slot on the object gets its own copy with the ground's shader mixed in through an Edge Breakup group. Other users of the original material are untouched, and removing the blend restores the slots.</p></div>
+    <div class="card"><h3>Housekeeping</h3>
+      <p>Duplicates join the same ground automatically. Node groups are version-stamped and rebuilt in place when you update the add-on, keeping your settings. A <b>Diagnose</b> button writes a report if something looks wrong.</p></div>
+  </div>
+</section>
+
+<section id="settings">
+  <h2>The settings that matter</h2>
+  <div class="tablewrap"><table>
+    <tr><th>Setting</th><th>Where</th><th>What it changes</th></tr>
+    <tr><td><b>Contact Distance</b></td><td>Object</td><td>How far from the object the ground starts to rise. Fitted to a third of the smaller of the object's width and its height above the ground.</td></tr>
+    <tr><td><b>Ground Conform</b></td><td>Object</td><td>How strongly the ground is pulled to the object: 1 hugs it, 0 leaves it flat.</td></tr>
+    <tr><td><b>Normal Blend Distance</b></td><td>Object</td><td>Width of the band where the object's shading turns toward the ground's.</td></tr>
+    <tr><td><b>Material Blend Distance</b></td><td>Object</td><td>How far up the object the ground's material reaches. Defaults to half the Contact Distance.</td></tr>
+    <tr><td><b>Breakup · Sharpness · Crevices</b></td><td>Material</td><td>How ragged the material edge is, how hard its threshold, and how much it prefers cavities over ridges.</td></tr>
+    <tr><td><b>Contact Subdivisions</b></td><td>Shared ground</td><td>Extra resolution inside the contact island only.</td></tr>
+    <tr><td><b>Contact Smoothing</b></td><td>Shared ground</td><td>Stops the ground crumpling against rough scans.</td></tr>
+    <tr><td><b>Fit Size</b></td><td>Button</td><td>Re-fits every distance after you rescale or re-sink an object.</td></tr>
+  </table></div>
+</section>
+
+<section id="perf">
+  <h2>What it costs</h2>
+  <p class="sub">Measured headless on a 4-core CPU with a 490,000-vertex ground (700 × 700 grid) and Contact Distance pinned to ⅓ m. Dense, overlapping layouts cost the most.</p>
+  <div class="tablewrap"><table>
+    <tr><th>Objects on the ground</th><th>Move one object</th><th>Re-evaluate everything</th></tr>
+    <tr><td>1</td><td class="n">≈ 0.8 s</td><td class="n">≈ 0.8 s</td></tr>
+    <tr><td>10</td><td class="n">≈ 1.5 s</td><td class="n">≈ 4.4 s</td></tr>
+    <tr><td>30</td><td class="n">≈ 3.9 s</td><td class="n">≈ 13.4 s</td></tr>
+  </table></div>
+  <p class="meta" style="margin-top:12px">The scene-update handler itself stays under 2 ms with 2,000 objects in the file. On lighter grounds everything is proportionally quicker; turn off <b>Displace Ground</b> on an object to skip the conform entirely.</p>
+</section>
+
+<section id="limits">
+  <h2>Known limits</h2>
+  <p class="sub">Things worth knowing before you rely on it for a shot.</p>
+  <ul class="plain">
+    <li><b>Sloped flanks stretch the material band.</b> Where the meniscus hugs a slanted side, the ground texture on the object runs at about a third of its true rate and can read as vertical strands. Narrow the Material Blend Distance there.</li>
+    <li><b>Extreme close-ups show the mesh.</b> The material edge is drawn from per-vertex values, so when facets are many pixels wide the edge follows the triangles. Subdivide the object or soften Sharpness.</li>
+    <li><b>Crowded grounds are slow to edit.</b> Each group of overlapping neighbours adds roughly half a second per update on a heavy ground.</li>
+    <li><b>Tested on Blender 5.1.2, 5.2.5 and 5.3.0</b> through the automated suites. 5.0 is supported on paper but untested, and the panel layout has only been exercised by tests, not reviewed in a live session.</li>
+    <li><b>The demo renders are not retouched.</b> They show these limits honestly, most visibly the strands on the centre boulder and the sand skirt in the macro shot.</li>
+  </ul>
+</section>
+
+<section id="install">
+  <h2>Install</h2>
+  <div class="two">
+    <div class="card"><h3>As an extension (recommended)</h3>
+      <p>Download <a href="../dist/contact_blend-2.0.0.zip" download><code>contact_blend-2.0.0.zip</code></a>, then drag it into the Blender window, or use <code>Edit &gt; Preferences &gt; Get Extensions &gt; Install from Disk…</code>. Requires Blender 5.0 or later.</p></div>
+    <div class="card"><h3>As a single file</h3>
+      <p>Download <a href="../contact_blend.py"><code>contact_blend.py</code></a> and install it from <code>Edit &gt; Preferences &gt; Add-ons &gt; Install from Disk…</code>. Same code, no packaging.</p></div>
+  </div>
+  <h3 style="margin:28px 0 12px">Rebuild from source</h3>
+  <pre>python tools/build_dist.py                      # dist/contact_blend-2.0.0.zip
+blender -b -P demo/build_demos.py -- --wire     # the three demo scenes and every render on this page</pre>
+  <p class="meta" style="margin-top:12px">Upgrading from 1.x? Existing files keep working; see the <a href="../README.md">README</a> for details.</p>
+</section>
+
+<footer>
+  Contact Blend is released under the Apache-2.0 licence. Demo assets are CC0 from
+  <a href="https://polyhaven.com">Poly Haven</a>; the 24 scans, textures and HDRIs used are listed in
+  <a href="../demo/CREDITS.md">demo/CREDITS.md</a>.
+</footer>
+
+</div>
+<script>
+document.querySelectorAll('.cmp').forEach(function (cmp) {
+  var scene = cmp.dataset.scene, stage = cmp.querySelector('.stage'), range = stage.querySelector('input');
+  var before = stage.querySelector('.before'), after = stage.querySelector('.after');
+  function place() { stage.style.setProperty('--x', range.value + '%'); }
+  range.addEventListener('input', place); place();
+  cmp.querySelectorAll('.seg button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      cmp.querySelectorAll('.seg button').forEach(function (o) { o.setAttribute('aria-pressed', String(o === b)); });
+      var base = '../demo/renders/' + scene + '_' + b.dataset.mode;
+      before.src = base + 'before.jpg'; after.src = base + 'after.jpg';
+    });
+  });
+});
+</script>
+</body>
+</html>
