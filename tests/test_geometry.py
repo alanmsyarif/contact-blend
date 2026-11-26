@@ -394,7 +394,11 @@ class GeometryTests(unittest.TestCase):
                      height=lambda x, y: 0.02 * math.cos(2 * math.pi * x / wave) if x < 0 else 0.0)
         sheet.location = (0.1, 0.0, 0.2)
         self.material(sheet, "Rock")
-        self.apply(sheet, ground)
+        mod, ids = self.apply(sheet, ground)
+        # cavity is measured in tenths of Material Blend Distance; the fit would size it to the
+        # sheet's 4 cm thickness, which makes float noise on the flat half visible
+        cb.set_socket(mod, "Material Blend Distance", 0.05)
+        sheet.update_tag()
         me = self.evaluated(sheet)
         self.assertIn(cb.CAVITY_ATTR, me.attributes, "no cavity for the shader to read")
         cavity = me.attributes[cb.CAVITY_ATTR].data
@@ -465,6 +469,32 @@ class GeometryTests(unittest.TestCase):
         self.assertGreater(bent[False], 0.3, "the open stem is not welded; the test is not biting")
         self.assertLess(bent[True], 0.5 * bent[False],
                         f"welded towards the overhang: {bent[True]:.3f} vs {bent[False]:.3f} rad in the open")
+
+    def test_cavity_keeps_soil_off_undersides(self):
+        # Soil does not sit under an overhang: the undercut base of a scanned rock wore a
+        # fringe of ground texture hanging off it (forest demo). A sheet facing straight down
+        # must read as a ridge (rock wins); the same sheet facing up stays neutral.
+        for flip, x in ((False, -3.0), (True, 3.0)):
+            ground = grid("Ground", 4, 40)
+            ground.location.x = x
+            self.material(ground, "Ground")
+            sheet = grid("Up" if not flip else "Down", 0.6, 12)
+            if flip:
+                sheet.data.flip_normals()
+            sheet.location = (x, 0.03, 0.15)
+            self.material(sheet, sheet.name)
+            mod, ids = self.apply(sheet, ground)
+            cb.set_socket(mod, "Material Blend Distance", 0.05)
+            sheet.update_tag()
+            me = self.evaluated(sheet)
+            values = [me.attributes[cb.CAVITY_ATTR].data[v.index].value for v in me.vertices
+                      if abs(v.co.z) < 1e-4 and max(abs(v.co.x), abs(v.co.y)) < 0.2]
+            self.assertTrue(values, "no sheet interior; the test is not biting")
+            if flip:
+                self.assertLess(max(values), 0.02, "an underside reads as a place soil would lie")
+            else:
+                for value in values:
+                    self.assertAlmostEqual(value, 0.5, delta=1e-3)
 
     def test_instanced_target_is_realized(self):
         ground = grid("Ground", 4, 40)

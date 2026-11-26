@@ -2,8 +2,11 @@
 # Poly Haven downloads for the demo scenes (rebuilt by demo/build_demos.py)
 demo/assets/
 *.blend1
-# over the 45 MB limit for committed demo files (131 MB with its textures packed); rebuild it
+# over the 45 MB limit for committed demo files; rebuild them with build_demos.py --no-render
+# (forest.blend was tracked before it outgrew the limit: `git rm --cached demo/forest.blend`)
 demo/boulders.blend
+demo/forest.blend
 # quick --preview renders
 demo/renders/*_preview.jpg
+demo/renders/*_preview.json
 __pycache__/

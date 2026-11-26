@@ -1,0 +1,166 @@
+{
+  "objects": {
+    "Mossy boulder": {
+      "settings": {
+        "Target": "Forest floor",
+        "Contact Distance": 0.30582,
+        "Surface Offset": 0.00367,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.20388,
+        "Material Blend Distance": 0.15291,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 0,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "rock_moss_set_02.002 (Contact Blend)": {
+          "Noise Scale": 4.904841,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Mossy rock": {
+      "settings": {
+        "Target": "Forest floor",
+        "Contact Distance": 0.124508,
+        "Surface Offset": 0.001494,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.083005,
+        "Material Blend Distance": 0.062254,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 1,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "rock_moss_set_02.002 (Contact Blend).002": {
+          "Noise Scale": 12.047413,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Small mossy rock": {
+      "settings": {
+        "Target": "Forest floor",
+        "Contact Distance": 0.079125,
+        "Surface Offset": 0.000949,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.05275,
+        "Material Blend Distance": 0.039562,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 2,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "rock_moss_set_02.002 (Contact Blend).001": {
+          "Noise Scale": 11.37442,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Pine roots": {
+      "settings": {
+        "Target": "Forest floor",
+        "Contact Distance": 0.026115,
+        "Surface Offset": 0.000313,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.01741,
+        "Material Blend Distance": 0.013057,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 1,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "pine_roots_a.001 (Contact Blend)": {
+          "Noise Scale": 57.438728,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    },
+    "Fallen branch": {
+      "settings": {
+        "Target": "Forest floor",
+        "Contact Distance": 0.073568,
+        "Surface Offset": 0.000883,
+        "Displace Ground": true,
+        "Ground Conform": 1.0,
+        "Contact Subdivisions": 2,
+        "Ground Detail": 0.0,
+        "Detail UV Map": "UVMap",
+        "Detail Midlevel": 0.0,
+        "Normal Blend Distance": 0.049045,
+        "Material Blend Distance": 0.036784,
+        "Match Target Textures": true,
+        "Target UV Map": "UVMap",
+        "Shared Ground": true,
+        "Ground Group": 2,
+        "Contact Smoothing": 8
+      },
+      "breakup": {
+        "dry_branches_medium_01.002 (Contact Blend)": {
+          "Noise Scale": 20.389282,
+          "Breakup": 0.5,
+          "Sharpness": 0.75,
+          "Crevices": 0.8
+        }
+      }
+    }
+  },
+  "ground": {
+    "Target": "Forest floor",
+    "Objects": "Forest floor \u00b7 Contact Blend Objects",
+    "Contact Subdivisions": 2,
+    "Ground Detail": 0.0,
+    "Detail UV Map": "UVMap",
+    "Detail Midlevel": 0.0,
+    "Contact Smoothing": 8,
+    "Target Material": "Forest floor",
+    "Ground Material": "Forest floor (Contact Blend Ground)",
+    "UV Map": "UVMap"
+  },
+  "timings_s": {
+    "build_scene": 14.3,
+    "render_before": 132.0,
+    "render_wire_before": 43.1,
+    "blend_and_evaluate": 85.9,
+    "render_after": 163.4,
+    "render_wire_after": 65.6,
+    "render_hero": 560.2,
+    "total_to_save": 1064.8
+  }
+}

@@ -28,7 +28,7 @@ LEGACY_NAMES = ("Blend To Surface",)
 # number, so an existing .blend picks up fixes on reload instead of silently running the tree
 # it was first built with -- a stale group is indistinguishable from a bug that did not get
 # fixed, and telling people to delete it by hand is exactly how it survives.
-GROUP_VERSION = 17
+GROUP_VERSION = 19
 # The stamp moved with the rename. An old group carries the value under the old key, so read
 # both and rewrite to the current one -- treating the old key as unstamped would force a
 # needless rebuild, and the diagnostic would report a group of unknown vintage.
@@ -45,7 +45,7 @@ GROUND_GROUP = "Contact Blend Ground"
 # The ground group is stamped under its own key: _is_ours() treats anything carrying
 # VERSION_KEY as a hero group, and the two must never be mistaken for each other.
 GROUND_VERSION_KEY = "cb_ground_version"
-GROUND_VERSION = 4
+GROUND_VERSION = 5
 PARAMS_ATTR = "cb_params"
 NORMAL_ATTR = "cb_normal"
 GROUP_ATTR = "cb_group"
@@ -452,8 +452,42 @@ class _Tree:
         goal = self.vmath(x + 200, y, "SUBTRACT", closest, sink)
         return self.vmath(x + 400, y, "SUBTRACT", goal, self.pos)
 
+    def unfold_uvs(self, x, y, geo, raw, move, up, uv_name):
+        """Give the moved part of the ground UVs at its real-world scale again.
+
+        The conform carries each ground vertex's UVs along with it, so where the ground climbs
+        an object's flank as a meniscus, a short stretch of the flat ground's texture is spread
+        up a steep wall: streaks and fans of stretched texture at every junction, wherever the
+        material blend is not covering them. Instead read the raw ground's own mapping at
+        p + h*g: p where the vertex now is, h how far it was lifted (its move along the ground's
+        normal `up`), g the horizontal direction of its move, towards the object. Going in
+        towards the object the texture then advances with the horizontal distance plus the
+        height climbed -- arc length, as if the wall were folded down flat -- and where nothing
+        moved (h = 0, no horizontal move) it is exactly the original UV, so the moved patch
+        meets the rest of the ground without a seam. Exact for planar ground UVs, which the
+        nearest-surface lookup measures rather than assumes.
+        """
+        lift = self.vmath(x, y - 200, "DOT_PRODUCT", move, up)
+        height = self.math(x + 100, y - 200, "MAXIMUM", lift, 0.0)
+        across = self.vmath(x + 200, y - 300, "NORMALIZE",
+                            self.vmath(x + 100, y - 300, "SUBTRACT", move, self.vmath(x, y - 300, "SCALE", up, scale=lift)))
+        where = self.vmath(x + 300, y - 250, "ADD", self.pos, self.vmath(x + 200, y - 400, "SCALE", across, scale=height))
+        uv_in = self.node("GeometryNodeInputNamedAttribute", x, y - 500, data_type="FLOAT_VECTOR")
+        self.link(uv_name, uv_in.inputs["Name"])
+        look = self.node("GeometryNodeSampleNearestSurface", x + 400, y - 400, data_type="FLOAT_VECTOR")
+        self.link(raw, look.inputs["Mesh"])
+        self.link(uv_in.outputs["Attribute"], look.inputs["Value"])
+        self.link(where, look.inputs["Sample Position"])
+        store = self.node("GeometryNodeStoreNamedAttribute", x + 600, y, data_type="FLOAT2", domain="CORNER")
+        self.link(geo, store.inputs["Geometry"])
+        self.link(uv_name, store.inputs["Name"])
+        self.link(self.math(x + 400, y - 100, "GREATER_THAN", self.vmath(x + 300, y - 100, "LENGTH", move), 0.0),
+                  store.inputs["Selection"])
+        self.link(look.outputs["Value"], store.inputs["Value"])
+        return store.outputs["Geometry"]
+
     def conform(self, x, y, raw, dist, closest, radius, island_radius, conform, offset, sink_dir,
-                level, detail):
+                level, detail, uv_name=None):
         """Conform `raw` (the ground) to the one object that `dist`/`closest` measure against.
 
         The seam is the curve where the two surfaces cross, so the only way to remove it is to
@@ -483,10 +517,19 @@ class _Tree:
         w = self.ramp(x + 1600, y + 300, dist, radius, conform, 0.0)
         move = self.vmath(x + 2000, y + 200, "SCALE",
                           self.goal_offset(x + 1600, y + 200, closest, sink_dir, offset), scale=w)
+        held = self.node("GeometryNodeCaptureAttribute", x + 2100, y + 100, domain="POINT")
+        held.capture_items.new("VECTOR", "move")
+        held.capture_items.new("VECTOR", "up")
+        self.link(displaced, held.inputs["Geometry"])
+        self.link(move, held.inputs["move"])
+        self.link(self.nor, held.inputs["up"])
         sp = self.node("GeometryNodeSetPosition", x + 2200, y)
-        self.link(displaced, sp.inputs["Geometry"])
-        self.link(move, sp.inputs["Offset"])
-        return self.rejoin(x + 2400, y, sep.outputs["Inverted"], sp.outputs["Geometry"])
+        self.link(held.outputs["Geometry"], sp.inputs["Geometry"])
+        self.link(held.outputs["move"], sp.inputs["Offset"])
+        moved = sp.outputs["Geometry"]
+        if uv_name is not None:
+            moved = self.unfold_uvs(x + 2300, y - 200, moved, raw, held.outputs["move"], held.outputs["up"], uv_name)
+        return self.rejoin(x + 2400, y, sep.outputs["Inverted"], moved)
 
     # --- the shared ground: several objects, per-object distances --------------------------
 
@@ -539,7 +582,7 @@ class _Tree:
         return (p.outputs["Is Valid"], p.outputs["Distance"], p.outputs["Position"], radius,
                 params.outputs[1], offset, sample(y - 500, NORMAL_ATTR))
 
-    def conform_groups(self, x, y, raw, heroes, scale, level, detail):
+    def conform_groups(self, x, y, raw, heroes, scale, level, detail, uv_name=None):
         """Conform `raw` to every object in `heroes` at once, continuously where they overlap.
 
         Conforming each ground vertex to its single nearest object folds the ground wherever two
@@ -676,11 +719,21 @@ class _Tree:
         summed = self.repeat(x + 6600, y, start, groups, conform_body)
         inv = self.math(x + 8400, y - 300, "DIVIDE", 1.0,
                         self.math(x + 8200, y - 300, "MAXIMUM", self.named(x + 8000, y - 300, "cb_tmp_w"), 1e-30))
+        total = self.vmath(x + 8400, y - 100, "SCALE", self.named(x + 8200, y - 100, "cb_tmp_move", "FLOAT_VECTOR"),
+                           scale=inv)
+        held = self.node("GeometryNodeCaptureAttribute", x + 8500, y + 100, domain="POINT")
+        held.capture_items.new("VECTOR", "move")
+        held.capture_items.new("VECTOR", "up")
+        self.link(summed, held.inputs["Geometry"])
+        self.link(total, held.inputs["move"])
+        self.link(self.nor, held.inputs["up"])
         sp = self.node("GeometryNodeSetPosition", x + 8600, y)
-        self.link(summed, sp.inputs["Geometry"])
-        self.link(self.vmath(x + 8400, y - 100, "SCALE", self.named(x + 8200, y - 100, "cb_tmp_move", "FLOAT_VECTOR"),
-                             scale=inv), sp.inputs["Offset"])
-        out = self.rejoin(x + 8800, y, rest.outputs["Geometry"], sp.outputs["Geometry"])
+        self.link(held.outputs["Geometry"], sp.inputs["Geometry"])
+        self.link(held.outputs["move"], sp.inputs["Offset"])
+        moved = sp.outputs["Geometry"]
+        if uv_name is not None:
+            moved = self.unfold_uvs(x + 8700, y - 200, moved, raw, held.outputs["move"], held.outputs["up"], uv_name)
+        out = self.rejoin(x + 8800, y, rest.outputs["Geometry"], moved)
         clean = self.node("GeometryNodeRemoveAttribute", x + 9400, y)
         self.link(out, clean.inputs["Geometry"])
         clean.inputs["Pattern Mode"].default_value = "Wildcard"
@@ -781,7 +834,7 @@ def _build_group(ng):
 
     def conform(y, ground, sink):
         return t.conform(200, y, ground, d_tgt, p_tgt, contact, contact, g["Ground Conform"],
-                         offset, sink, g["Contact Subdivisions"], detail)
+                         offset, sink, g["Contact Subdivisions"], detail, uv_name=g["Target UV Map"])
 
     # Joined mode: the whole target, conformed, is joined into this object's output.
     full = conform(-900, raw, sink_dir)
@@ -826,10 +879,18 @@ def _build_group(ng):
     link(t.math(2850, 300, "DIVIDE", depth, unit), cavity.inputs[0])
     cavity.inputs[1].default_value, cavity.inputs[2].default_value = -1.0, 1.0
     cavity.inputs[3].default_value, cavity.inputs[4].default_value = 0.0, 1.0
+    # Soil does not sit on the underside of an overhang: a face looking down (against the
+    # ground's normal) reads as a ridge, so the rock wins there, and the undercut base of a
+    # scan no longer wears a fringe of ground texture hanging off it. Faces level or looking
+    # up keep their cavity. (At the contact itself, blend 1, the ground still wins.)
+    ground_up = t.vmath(2700, 400, "NORMALIZE", t.sample(2600, 400, raw, t.nor))
+    upward = t.node("ShaderNodeMapRange", 2800, 400, interpolation_type="SMOOTHSTEP", clamp=True)
+    link(t.vmath(2750, 450, "DOT_PRODUCT", t.nor, ground_up), upward.inputs[0])
+    upward.inputs[1].default_value, upward.inputs[2].default_value = -0.6, 0.0
     cav_store = t.node("GeometryNodeStoreNamedAttribute", 3000, 100, data_type="FLOAT", domain="POINT")
     cav_store.inputs["Name"].default_value = CAVITY_ATTR
     link(hero, cav_store.inputs["Geometry"])
-    link(cavity.outputs[0], cav_store.inputs["Value"])
+    link(t.math(2950, 200, "MULTIPLY", cavity.outputs[0], upward.outputs[0]), cav_store.inputs["Value"])
 
     store = t.node("GeometryNodeStoreNamedAttribute", 3200, 0, data_type="FLOAT", domain="POINT")
     store.inputs["Name"].default_value = ATTR
@@ -1014,6 +1075,9 @@ def _build_ground_group(ng):
     _socket(ng, "Contact Smoothing", "NodeSocketInt", default_value=SMOOTHING, min_value=0, max_value=64)
     _socket(ng, "Target Material", "NodeSocketMaterial")
     _socket(ng, "Ground Material", "NodeSocketMaterial")
+    # The target's render UV map, whose texture the conform unfolds up each meniscus (set by
+    # sync_ground; see _Tree.unfold_uvs).
+    _socket(ng, "UV Map", "NodeSocketString", default_value="UVMap")
 
     t = _Tree(ng)
     link = t.link
@@ -1031,7 +1095,7 @@ def _build_ground_group(ng):
 
     detail = (g["Detail Image"], g["Detail UV Map"], g["Detail Midlevel"],
               t.math(-500, 400, "DIVIDE", g["Ground Detail"], scale))
-    conformed = t.conform_groups(0, 0, raw, heroes, scale, g["Contact Subdivisions"], detail)
+    conformed = t.conform_groups(0, 0, raw, heroes, scale, g["Contact Subdivisions"], detail, uv_name=g["UV Map"])
     # With no objects, or none that may move the ground (all have Displace Ground off or Ground
     # Conform 0, which they write as weight 0), there is nothing to do: pass the target through
     # untouched without evaluating any of the conform. The statistic of an empty geometry is 0.
@@ -2121,6 +2185,9 @@ def sync_ground(tgt, refresh=False, seed=None):
     proxy[REACH_KEY] = ground_reach(tgt)
     coll[PROXY_KEY] = proxy
     assign_groups(tgt, heroes, proxy[REACH_KEY])
+    uv_name = _target_uv_name(tgt)
+    if socket(mod, "UV Map") is not None and socket(mod, "UV Map") != uv_name:
+        set_socket(mod, "UV Map", uv_name)
     # One corrected ground material per target, however many objects stand on it.
     tmat = tgt.active_material
     if refresh or socket(mod, "Target Material") != tmat or socket(mod, "Ground Material") is None:

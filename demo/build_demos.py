@@ -102,7 +102,7 @@ def texture_size(asset, default=2.0):
     return (max(dims) / 1000.0) if dims else default
 
 
-def write_credits():
+def write_credits(merge=True):
     lines = ["# Demo asset credits", "",
              "Every asset in the demo scenes comes from [Poly Haven](https://polyhaven.com) and is "
              "released under [CC0](https://creativecommons.org/publicdomain/zero/1.0/) (public "
@@ -112,7 +112,7 @@ def write_credits():
     credits = HERE / "CREDITS.md"
     used = {asset: kind for kind, asset in re.findall(
         r"\| (\w+) \| [^|]* \| https://polyhaven.com/a/(\w+) \|",
-        credits.read_text())} if credits.exists() else {}
+        credits.read_text())} if credits.exists() and merge else {}
     used.update(USED)
     for asset, kind in sorted(used.items()):
         info = api(f"info/{asset}")
@@ -230,7 +230,7 @@ def ground_material(name, maps, tile, variation=True, shade=(0.9, 1.07), micro=0
     return mat
 
 
-def micro_displace(obj, pixel=1.0):
+def micro_displace(obj, pixel=2.0):
     """Dice `obj` per pixel at render time (adaptive subdivision, last in its stack) so its
     material's displacement makes real geometry."""
     sub = obj.modifiers.new("Micro", "SUBSURF")
@@ -615,20 +615,49 @@ def record(name, heroes, proxy, timings):
     (RENDERS / f"{name}.json").write_text(json.dumps(data, indent=2))
 
 
-def save_light(name):
-    """Save demo/<name>.blend with every texture packed, images over 2k packed as 2k copies:
-    the renders use full resolution, the file stays small enough to keep in the repository."""
-    for img in bpy.data.images:
-        if img.source == "FILE" and max(img.size) > 2048:
+def save_light(name, limit=1024):
+    """Save demo/<name>.blend self-contained but small: duplicate appended meshes and images
+    merged, every image but the sky packed as a JPEG of at most `limit` pixels. The renders
+    use the full-resolution files; the .blend is for opening the scene, not for re-rendering
+    the hero at full quality (run this script for that)."""
+    import tempfile
+    for is_mesh, kind in ((True, bpy.data.meshes), (False, bpy.data.images)):
+        first = {}
+        for block in list(kind):
+            key = (re.sub(r"\.\d{3}$", "", block.name),
+                   len(block.polygons) if is_mesh else block.filepath)
+            if key in first and block is not first[key]:
+                block.user_remap(first[key])
+            else:
+                first.setdefault(key, block)
+    sky = {n.image for w in bpy.data.worlds if w.node_tree for n in w.node_tree.nodes
+           if n.type == "TEX_ENVIRONMENT"}
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="cb-demo-"))
+    for i, img in enumerate(list(bpy.data.images)):
+        if img.users == 0 or img in sky or img.source != "FILE" or not img.has_data and not img.filepath:
+            continue
+        try:
             w, h = img.size
-            f = 2048 / max(w, h)
-            img.scale(max(1, int(w * f)), max(1, int(h * f)))
+            if max(w, h) > limit:
+                f = limit / max(w, h)
+                img.scale(max(1, int(w * f)), max(1, int(h * f)))
+            out = tmp / f"{i:03d}.jpg"
+            img.filepath_raw = str(out)
+            img.file_format = "JPEG"
+            img.save()
+            img.unpack(method="REMOVE") if img.packed_file else None
+            img.filepath = str(out)
+            img.reload()
             img.pack()
+        except RuntimeError as err:          # an image that will not load: pack what there is
+            print(f"  kept {img.name} as is ({err})", flush=True)
     bpy.ops.file.pack_all()
     path = HERE / f"{name}.blend"
     bpy.ops.wm.save_as_mainfile(filepath=str(path), compress=True)
-    print(f"saved {path.name}: {path.stat().st_size / 1e6:.1f} MB", flush=True)
-    return path.stat().st_size / 1e6
+    size = path.stat().st_size / 1e6
+    print(f"saved {path.name}: {size:.1f} MB{'  (over 45 MB: not for the repository)' if size > 45 else ''}",
+          flush=True)
+    return size
 
 
 # --- the scenes ------------------------------------------------------------------------------
@@ -654,7 +683,7 @@ def forest(args):
     world(scene, sky, rotation_deg=sun_rotation(sky, 115), strength=1.0)
     maps = texture("forest_leaves_04", "4k")
     tile = texture_size("forest_leaves_04")
-    floor = ground("Forest floor", 14, 1400, maps, tile, height=0.05,
+    floor = ground("Forest floor", 30, 1500, maps, tile, height=0.05,
                    material=ground_material("Forest floor", maps, tile))
     rocks = lod0("rock_moss_set_02", names=("rock11", "rock08", "rock09"))
     big = next(o for o in rocks if "rock11" in o.name)
@@ -685,7 +714,15 @@ def forest(args):
             (0.6, 1.0), 5, keep_clear, sink=0.3, tilt=4, name="Twig")
     scatter(lod0("rock_moss_set_02", names=("rock09", "rock12")), floor, 10, ((-5, 5), (-3, 5)),
             (0.12, 0.3), 7, keep_clear, sink=0.35, tilt=20, name="Stone")
-    apron(floor, 90, 0.1, maps, tile, height=0.05)
+    far = apron(floor, 90, 0.2, maps, tile, height=0.05)
+    # young firs and pines, and more ferns, between 7 and 40 m: a forest floor runs into
+    # undergrowth and trunks, never into a bare plain before the photographed trees
+    scatter(lod0("fir_sapling") + lod0("pine_sapling_small"), floor, 40, ((-14, 14), (6, 15)), (1.0, 2.6), 21,
+            keep_clear, sink=0.05, tilt=4, name="Sapling")
+    scatter(lod0("fir_sapling") + lod0("pine_sapling_small"), far, 60, ((-35, 25), (15, 45)), (1.5, 3.0), 22,
+            sink=0.05, tilt=4, name="Far sapling")
+    scatter(lod0("fern_02"), floor, 30, ((-12, 12), (6, 15)), (0.8, 1.3), 23, keep_clear, sink=0.05,
+            name="Far fern")
     return floor, blended, {"cams": [
         # crouching, 50 mm: the boulder's base and the roots against it are the subject
         ("hero", (3.0, -3.6, 0.85), (0.3, 0.0, 0.05), 50, 8),
@@ -728,7 +765,7 @@ def boulders(args):
     scatter(lod0("cheiridopsis_succulent"), floor, 7, ((-8, 8), (1, 8)), (0.8, 1.1), 17, keep_clear,
             sink=0.05, name="Succulent")
     cliff = append_objects(model("namaqualand_cliff_02"), rename="Outcrop")[0]
-    place(cliff, (-14.0, 60.0, 0.0), (0, 0, 200), scale=1.6, sink=0.25)
+    place(cliff, (-22.0, 85.0, 0.0), (0, 0, 200), scale=1.0, sink=0.35)
     apron(floor, 400, 0.5, maps, tile, height=0.04)
     return floor, rocks, {"cams": [
         ("hero", (2.4, -7.6, 1.45), (0.2, 0.0, 0.55), 45, 11),
@@ -741,7 +778,9 @@ def macro(args):
     scene = reset()
     sky = hdri("rogland_sunset")
     world(scene, sky, rotation_deg=sun_rotation(sky, 60), strength=1.0)
-    maps = texture("sand_01", "8k", disp_res="4k")
+    # 4k maps (0.37 mm per texel) and 2-pixel dicing: 8k maps with per-pixel dicing ran a
+    # 15 GB machine out of memory at full resolution
+    maps = texture("sand_01", "4k")
     tile = texture_size("sand_01")
     floor = ground("Sand", 1.2, 960, maps, tile, height=0.0,
                    material=ground_material("Sand", maps, tile, shade=(0.96, 1.03), micro=0.0025))
@@ -761,7 +800,10 @@ TUNING = {
     "forest": dict(objects={}, ground={"Contact Subdivisions": 2}),
     "boulders": dict(objects={}, ground={"Contact Subdivisions": 2}),
     # Half the default rise: at 1:1 the sand climbed over the stone's low lobe like a pillow.
-    "macro": dict(objects={"Ground Conform": 0.5}, ground={"Contact Subdivisions": 2}),
+    # And a softer edge: at this magnification the scan's 3 mm facets are ten pixels across,
+    # and the fitted sharp edge, drawn from per-point values, followed them in triangles.
+    "macro": dict(objects={"Ground Conform": 0.5}, ground={"Contact Subdivisions": 2},
+                  breakup={"Sharpness": 0.35, "Crevices": 0.5}),
 }
 
 
@@ -801,6 +843,11 @@ def build(name, args):
     for rock in rocks:
         for socket_name, value in tuning["objects"].items():
             assert cb.set_socket(cb.find_mod(rock), socket_name, value), socket_name
+        for slot in rock.material_slots:
+            node = cb.breakup_node(slot.material) if slot.material else None
+            for socket_name, value in tuning.get("breakup", {}).items():
+                if node is not None:
+                    node.inputs[socket_name].default_value = value
         rock.update_tag()
     tune_ground(proxy, **tuning["ground"])
     if "after_blend" in extra:
@@ -817,9 +864,12 @@ def build(name, args):
             composite(out["wire_before"], out["wire_after"], out["wire_compare"])
             breakdown(out["before"], out["after"], out["wire_before"], out["wire_after"], out["breakdown"])
     timings["total_to_save"] = round(time.time() - t_start, 1)
-    record(name + suffix, rocks, proxy, timings)
-    timings["blend_file_mb"] = round(save_light(name), 1) if not args.preview else None
-    record(name + suffix, rocks, proxy, timings)
+    if not args.no_render:                 # a --no-render build must not replace the render timings
+        record(name + suffix, rocks, proxy, timings)
+    size = round(save_light(name), 1) if not args.preview else None
+    if not args.no_render:
+        timings["blend_file_mb"] = size
+        record(name + suffix, rocks, proxy, timings)
     print(f"timings {name}: {timings}", flush=True)
 
 
@@ -830,15 +880,32 @@ def main():
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--samples", type=int, default=192, help="hero image samples")
+    parser.add_argument("--resave", action="store_true",
+                        help="only re-save the scene's existing .blend through save_light (no rebuild)")
+    parser.add_argument("--texture-limit", type=int, default=1024,
+                        help="--resave: largest packed texture, in pixels")
+    parser.add_argument("--credits", action="store_true",
+                        help="only rebuild CREDITS.md from the assets every scene uses (no blend, no render)")
     parser.add_argument("--wire", action="store_true",
                         help="also render the wireframe pair, its split composite and the four-up breakdown")
     args = parser.parse_args(argv)
     cb.register()
     try:
+        if args.resave:
+            for name in args.scene or list(SCENES):
+                bpy.ops.wm.open_mainfile(filepath=str(HERE / f"{name}.blend"))
+                save_light(name, limit=args.texture_limit)
+            return
+        if args.credits:
+            for name in SCENES:
+                SCENES[name](args)           # fetches (from the cache) everything the scene uses
+            write_credits(merge=False)
+            return
         for name in args.scene or list(SCENES):
             build(name, args)
     finally:
-        write_credits()
+        if not (args.credits or args.resave):
+            write_credits()
         cb.unregister()
 
 
