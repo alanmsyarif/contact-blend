@@ -30,7 +30,7 @@ class TextureTests(unittest.TestCase):
         obj = bpy.context.object
         obj.name = name
         mat = bpy.data.materials.new(name)
-        mat.use_nodes = True
+        cb.ensure_node_tree(mat)
         obj.data.materials.append(mat)
         return obj
 
@@ -42,9 +42,18 @@ class TextureTests(unittest.TestCase):
         self.assertEqual(bpy.ops.object.contact_blend(), {"FINISHED"})
         mod = cb.find_mod(self.source)
         ids = cb.input_ids(mod.node_group)
-        mod[ids["Displace Ground"]] = ground
+        cb.set_socket(mod, "Displace Ground", ground)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         return mod, ids
+
+    def joined(self):
+        """Turn the blend into a pre-2.0 one: the ground joined into the object's own output."""
+        mod = cb.find_mod(self.source)
+        cb.set_socket(mod, "Shared Ground", False)
+        bpy.context.view_layer.objects.active = self.source
+        self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
+        self.assertIsNone(cb.find_proxy(self.target))
+        return mod
 
     def copied_nodes(self, kind):
         return [n for n in self.source.active_material.node_tree.nodes
@@ -82,37 +91,131 @@ class TextureTests(unittest.TestCase):
         self.target.data.materials.append(bpy.data.materials["Ground"])
         self.target.data.uv_layers.active.name = "GroundUV"
         bpy.data.objects.remove(self.source, do_unlink=True)
-        bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, 0.4))
+        # Off the grid lines: at (0, 0) the cube's sides lie exactly on ground edges, and which face
+        # a vertex sitting on the surface "belongs" to is then a coin toss decided by rounding.
+        bpy.ops.mesh.primitive_cube_add(size=1, location=(0.03, 0.02, 0.4))
         self.source = bpy.context.object
+        # vertices along the sides, so there are visible corners within every blend distance
+        bpy.ops.object.modifier_add(type="SUBSURF")
+        self.source.modifiers[0].subdivision_type = "SIMPLE"
+        self.source.modifiers[0].levels = 3
+        bpy.ops.object.modifier_apply(modifier=self.source.modifiers[0].name)
         self.source.data.materials.append(bpy.data.materials["Hero"])
         mod, ids = self.apply(ground=True)
-        evaluated = self.source.evaluated_get(bpy.context.evaluated_depsgraph_get())
-        mesh = evaluated.to_mesh()
+        # The expectation below uses each ground triangle's flat normal, which is exact where the
+        # conformed ground is flat around the cube's faces: conform to the cube itself, unsmoothed.
+        cb.set_socket(cb.ground_mod(cb.find_proxy(self.target)), "Contact Smoothing", 0)
+        cb.set_socket(mod, "Contact Smoothing", 0)
+        self.source.update_tag()
+        cb.find_proxy(self.target).update_tag()   # socket writes from Python do not tag; the UI would
+        # Shared: the object samples a locally conformed patch, which has to match the ground
+        # the proxy draws wherever the target shader can show (inside every blend distance).
+        reach = max(cb.socket(mod, "Contact Distance"), cb.socket(mod, "Material Blend Distance"),
+                    cb.socket(mod, "Normal Blend Distance"))
+        proxy = cb.find_proxy(self.target)
+        self.assertIsNotNone(proxy)
+        self.assertGreater(self.check_sampled_uvs(proxy, None, reach), 0)
+        # Joined: the object samples its own joined copy, everywhere.
+        self.joined()
+        self.assertGreater(self.check_sampled_uvs(self.source, cb.socket(mod, "Ground Material"), None), 0)
+
+    def check_sampled_uvs(self, ground_obj, ground_material, reach):
+        """Compare the object's projected UVs with the UVs on the ground it sits on. Returns
+        how many corners were checked."""
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        hero = self.source.evaluated_get(depsgraph)
+        mesh = hero.to_mesh()
+        ground = ground_obj.evaluated_get(depsgraph)
+        gmesh = mesh if ground_obj is self.source else ground.to_mesh()
         try:
-            mesh.calc_loop_triangles()
-            ground = mod[ids["Ground Material"]]
-            triangles = [tri for tri in mesh.loop_triangles
-                         if mesh.materials[tri.material_index].name == ground.name]
-            bvh = BVHTree.FromPolygons([v.co for v in mesh.vertices],
-                                      [tri.vertices for tri in triangles], all_triangles=True)
-            original_uvs = mesh.uv_layers["GroundUV"].data
+            gmesh.calc_loop_triangles()
+            to_hero = self.source.matrix_world.inverted() @ ground_obj.matrix_world
+            triangles = [tri for tri in gmesh.loop_triangles if ground_material is None
+                         or gmesh.materials[tri.material_index].name == ground_material.name]
+            co = [to_hero @ v.co for v in gmesh.vertices]
+            bvh = BVHTree.FromPolygons(co, [tri.vertices for tri in triangles], all_triangles=True)
+            original_uvs = gmesh.uv_layers["GroundUV"].data
             sampled_uvs = mesh.uv_layers[cb.TARGET_UV_ATTR].data
             count = 0
             for poly in mesh.polygons:
-                if mesh.materials[poly.material_index].name == ground.name:
+                if ground_material and mesh.materials[poly.material_index].name == ground_material.name:
                     continue
                 for index in poly.loop_indices:
                     point = mesh.vertices[mesh.loops[index].vertex_index].co
-                    nearest, _, tri_index, _ = bvh.find_nearest(point)
-                    tri = triangles[tri_index]
-                    expected = barycentric_transform(
-                        nearest, *(mesh.vertices[i].co for i in tri.vertices),
-                        *(Vector((*original_uvs[i].uv, 0)) for i in tri.loops))
-                    self.assertLess((sampled_uvs[index].uv - expected.xy).length, 1e-5)
+                    _, _, _, dist = bvh.find_nearest(point)
+                    if reach is not None and dist > reach:
+                        continue
+                    # Shared: only what can be seen. Under the conformed ground -- in the crater,
+                    # or just beneath the meniscus -- nearest-surface searches can settle on
+                    # different faces where several are equally near, and the object's patch and
+                    # the shared ground need not agree there; the joined copy is the very mesh
+                    # the object sampled, so it is compared everywhere.
+                    if reach is not None:
+                        near, normal, *_ = bvh.find_nearest(point)
+                        if (point - near).dot(normal) < 0:
+                            continue
+                    # Where several triangles are equally near (a crease the ground folds around),
+                    # which one is "the" nearest is decided by rounding; any of them is right.
+                    errors = []
+                    own_normal = self.source.data.polygons[poly.index].normal
+                    for near, _, near_index, _ in bvh.find_nearest_range(point, dist + 1e-6):
+                        tri = triangles[near_index]
+                        expected = barycentric_transform(
+                            near, *(co[i] for i in tri.vertices),
+                            *(Vector((*original_uvs[i].uv, 0)) for i in tri.loops))
+                        # above the ground the UVs continue across the object's flank (see
+                        # _build_group): height times the horizontal part of its own normal,
+                        # through the ground's planar mapping (4 m grid: 1/4 UV per metre)
+                        n = (co[tri.vertices[1]] - co[tri.vertices[0]]).cross(
+                            co[tri.vertices[2]] - co[tri.vertices[0]]).normalized()
+                        rise = point - near
+                        height = rise.length if rise.dot(n) > 0 else 0.0
+                        up = rise.normalized()
+                        across = own_normal - up * own_normal.dot(up)
+                        expected.xy += (across * height).xy / 4
+                        errors.append((sampled_uvs[index].uv - expected.xy).length)
+                    # Shared: the object's patch is computed in its own frame and the shared ground
+                    # in the target's, so their float32 noise (~1e-5 m) reaches the UVs, scaled
+                    # by the unfold height above the ground; joined compares like with like.
+                    self.assertLess(min(errors), 5e-5 if reach is not None else 1e-5)
                     count += 1
-            self.assertGreater(count, 0)
+            return count
         finally:
-            evaluated.to_mesh_clear()
+            if gmesh is not mesh:
+                ground.to_mesh_clear()
+            hero.to_mesh_clear()
+
+    def test_ground_uvs_are_not_stretched_up_a_steep_flank(self):
+        # A tall box with vertical sides on a flat 4 m plane: up the side, the projected ground
+        # UVs must advance at the ground's own rate (1/4 per metre), not stay frozen at the rim.
+        bpy.data.objects.remove(self.source, do_unlink=True)
+        bpy.ops.mesh.primitive_cube_add(size=1, location=(0.2, 0.1, 0.4))
+        self.source = bpy.context.object
+        self.source.data.materials.append(bpy.data.materials["Hero"])
+        bpy.ops.object.modifier_add(type="SUBSURF")
+        self.source.modifiers[0].subdivision_type = "SIMPLE"
+        self.source.modifiers[0].levels = 3
+        bpy.ops.object.modifier_apply(modifier=self.source.modifiers[0].name)
+        mod, ids = self.apply(ground=False)
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        mesh = self.source.evaluated_get(depsgraph).to_mesh()
+        try:
+            uv = mesh.uv_layers[cb.TARGET_UV_ATTR].data
+            column = {}          # corners on the -Y wall at x = world 0.2, by height
+            for poly in mesh.polygons:
+                if poly.normal.y > -0.99:
+                    continue
+                for index in poly.loop_indices:
+                    co = self.source.matrix_world @ mesh.vertices[mesh.loops[index].vertex_index].co
+                    if abs(co.x - 0.2) < 1e-4 and co.z > 0:
+                        column[round(co.z, 4)] = uv[index].uv.copy()
+            heights = sorted(column)
+            self.assertGreater(len(heights), 3)
+            for low, high in zip(heights, heights[1:]):
+                rate = (column[high] - column[low]).length / (high - low)
+                self.assertAlmostEqual(rate, 0.25, delta=0.25 * 0.02, msg=f"stretched between {low} and {high}")
+        finally:
+            self.source.evaluated_get(depsgraph).to_mesh_clear()
 
     def test_implicit_image_uvs_and_named_uv_nodes_are_rebound(self):
         tree = self.target.active_material.node_tree
@@ -145,10 +248,16 @@ class TextureTests(unittest.TestCase):
         tree.links.new(coord.outputs["Object"], noise.inputs["Vector"])
         mod, ids = self.apply(ground=True)
         self.assertEqual(self.copied_nodes("TEX_COORD")[0].object, self.target)
-        ground = mod[ids["Ground Material"]]
+        # shared: one corrected ground material, on the proxy
+        ground = cb.socket(cb.ground_mod(cb.find_proxy(self.target)), "Ground Material")
         self.assertNotEqual(ground, self.target.active_material)
         self.assertEqual(ground.node_tree.nodes[coord.name].object, self.target)
         self.assertIsNone(coord.object)
+        # joined: the object's own copy gets the same correction
+        self.joined()
+        ground = cb.socket(mod, "Ground Material")
+        self.assertNotEqual(ground, self.target.active_material)
+        self.assertEqual(ground.node_tree.nodes[coord.name].object, self.target)
 
     def test_explicit_external_object_reference_is_preserved(self):
         empty = bpy.data.objects.new("Mapping origin", None)
@@ -169,13 +278,14 @@ class TextureTests(unittest.TestCase):
         tree = self.target.active_material.node_tree
         node = tree.nodes.new("ShaderNodeGroup")
         node.node_tree = group
-        mod, ids = self.apply()
+        mod, ids = self.apply(ground=True)
         for _ in range(3):
             self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         copied = self.copied_nodes("GROUP")[0].node_tree
         self.assertNotEqual(copied, group)
         self.assertTrue(copied.nodes[image.name].inputs["Vector"].is_linked)
         self.assertFalse(image.inputs["Vector"].is_linked)
+        # one corrected ground material (the proxy's) and its private group, plus the object's
         self.assertEqual(sum(bool(m.get(cb.TEXTURE_DATA_KEY)) for m in bpy.data.materials), 1)
         self.assertEqual(sum(bool(g.get(cb.TEXTURE_DATA_KEY)) for g in bpy.data.node_groups), 2)
         self.assertEqual(bpy.ops.object.contact_blend_remove(), {"FINISHED"})
@@ -186,16 +296,21 @@ class TextureTests(unittest.TestCase):
     def test_texture_matching_can_be_disabled(self):
         self.target.active_material.node_tree.nodes.new("ShaderNodeTexImage")
         mod, ids = self.apply()
-        mod[ids["Match Target Textures"]] = False
+        cb.set_socket(mod, "Match Target Textures", False)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertFalse(self.copied_nodes("TEX_IMAGE")[0].inputs["Vector"].is_linked)
-        self.assertEqual(mod[ids["Ground Material"]], self.target.active_material)
-        evaluated = self.source.evaluated_get(bpy.context.evaluated_depsgraph_get())
-        mesh = evaluated.to_mesh()
-        try:
-            self.assertNotIn(cb.TARGET_UV_ATTR, mesh.attributes)
-        finally:
-            evaluated.to_mesh_clear()
+        for mode in ("shared", "joined"):
+            with self.subTest(mode=mode):
+                if mode == "joined":
+                    self.joined()
+                    # a joined copy then keeps the target's material unchanged
+                    self.assertEqual(cb.socket(mod, "Ground Material"), self.target.active_material)
+                evaluated = self.source.evaluated_get(bpy.context.evaluated_depsgraph_get())
+                mesh = evaluated.to_mesh()
+                try:
+                    self.assertNotIn(cb.TARGET_UV_ATTR, mesh.attributes)
+                finally:
+                    evaluated.to_mesh_clear()
 
     def test_additional_uv_maps_and_missing_uvs_are_reported(self):
         tree = self.target.active_material.node_tree
@@ -204,7 +319,7 @@ class TextureTests(unittest.TestCase):
         tree.nodes.new("ShaderNodeTexImage")
         mod, ids = self.apply()
         self.assertIn("SecondaryUV", self.source.active_material["cb_texture_warnings"])
-        mod[ids["Target UV Map"]] = "MissingUV"
+        cb.set_socket(mod, "Target UV Map", "MissingUV")
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         self.assertIn("UV map is missing", self.source.active_material["cb_texture_warnings"])
 
@@ -267,6 +382,140 @@ class TextureTests(unittest.TestCase):
                     self.assertGreater(max(reference[0::4]) - min(reference[0::4]), 0.2,
                                        "Reference must contain a visible pattern")
                     self.assertEqual(bpy.ops.object.contact_blend_remove(), {"FINISHED"})
+
+    def test_ground_colour_reaches_the_visible_junction(self):
+        """Side view, emission only: just above where the object meets the conformed ground it
+        must already be the ground's colour, and at the top its own."""
+        def emission(mat, colour):
+            tree = mat.node_tree
+            tree.nodes.clear()
+            emit = tree.nodes.new("ShaderNodeEmission")
+            emit.inputs["Color"].default_value = colour
+            out = tree.nodes.new("ShaderNodeOutputMaterial")
+            tree.links.new(emit.outputs[0], out.inputs["Surface"])
+
+        bpy.data.objects.remove(self.target, do_unlink=True)
+        bpy.data.objects.remove(self.source, do_unlink=True)
+        bpy.ops.mesh.primitive_grid_add(size=4, x_subdivisions=80, y_subdivisions=80)
+        self.target = bpy.context.object
+        self.target.data.materials.append(bpy.data.materials["Ground"])
+        emission(bpy.data.materials["Ground"], (1, 0, 0, 1))
+        bpy.ops.mesh.primitive_uv_sphere_add(segments=64, ring_count=32, radius=0.5, location=(0, 0, 0.25))
+        self.source = bpy.context.object
+        bpy.ops.object.shade_smooth()
+        self.source.data.materials.append(bpy.data.materials["Hero"])
+        emission(bpy.data.materials["Hero"], (0, 0, 1, 1))
+        mod, ids = self.apply(ground=True)
+        # A wide conform under a narrow material band: the meniscus climbs higher, relative to
+        # Material Blend Distance, than the band reaches from the flat original.
+        cb.set_socket(mod, "Contact Distance", 0.6)
+        cb.set_socket(mod, "Material Blend Distance", 0.15)
+        cb.set_socket(mod, "Normal Blend Distance", 0.1)
+        self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
+        proxy = cb.find_proxy(self.target)
+        evaluated = proxy.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        mesh = evaluated.to_mesh()
+        # the meniscus top facing the camera, on the image's centre column
+        junction = max(v.co.z for v in mesh.vertices if abs(v.co.x) < 0.03 and v.co.y < 0)
+        evaluated.to_mesh_clear()
+        self.assertGreater(junction, 0.03, "no meniscus to measure against")
+
+        scene = bpy.context.scene
+        bpy.ops.object.camera_add(location=(0, -5, 0.3), rotation=(1.5707963, 0, 0))
+        scene.camera = bpy.context.object
+        scene.camera.data.type = "ORTHO"
+        scene.camera.data.ortho_scale = 1.6
+        scene.render.engine = "CYCLES"
+        scene.cycles.device = "CPU"
+        scene.cycles.samples = 1
+        scene.cycles.use_denoising = False
+        scene.cycles.filter_width = 0.01            # no bleed from the ground pixels below
+        scene.render.resolution_x = scene.render.resolution_y = size = 200
+        scene.render.resolution_percentage = 100
+        scene.view_settings.view_transform = "Standard"
+        scene.render.image_settings.file_format = "OPEN_EXR"
+        scene.render.image_settings.color_depth = "32"
+        with tempfile.TemporaryDirectory(prefix="contact-blend-junction-") as tmp:
+            path = pathlib.Path(tmp) / "junction.exr"
+            scene.render.filepath = str(path)
+            bpy.ops.render.render(write_still=True)
+            image = bpy.data.images.load(str(path), check_existing=False)
+            pixels = list(image.pixels)
+            bpy.data.images.remove(image)
+
+        def pixel(z):
+            """RGB at the centre column, height z (image rows run bottom-up)."""
+            row = int((z - (0.3 - 0.8)) / 1.6 * size)
+            i = (row * size + size // 2) * 4
+            return pixels[i:i + 3]
+
+        pixel_size = 1.6 / size
+        red, _, blue = pixel(junction + 2.5 * pixel_size)
+        self.assertGreater(red, 0.85, f"rock just above the junction is not ground-coloured ({red}, {blue})")
+        red, _, blue = pixel(0.7)
+        self.assertGreater(blue, 0.99, f"top of the rock is not its own colour ({red}, {blue})")
+
+    def test_breakup_is_identity_by_default_and_never_moves_the_ends(self):
+        """Render the breakup group's output straight to emission, compared to its input."""
+        tree = self.source.active_material.node_tree
+        tree.nodes.clear()
+        emission = tree.nodes.new("ShaderNodeEmission")
+        output = tree.nodes.new("ShaderNodeOutputMaterial")
+        tree.links.new(emission.outputs[0], output.inputs["Surface"])
+        value = tree.nodes.new("ShaderNodeValue")
+        breakup = tree.nodes.new("ShaderNodeGroup")
+        breakup.node_tree = cb.breakup_group()
+        names = emission.name, value.name, breakup.name
+        self.source.scale = (3, 3, 1)
+        self.target.hide_render = True
+        bpy.ops.object.camera_add(location=(0.2, 0.3, 3))
+        scene = bpy.context.scene
+        scene.camera = bpy.context.object
+        scene.camera.data.type = "ORTHO"
+        scene.camera.data.ortho_scale = 2
+        scene.render.engine = "CYCLES"
+        scene.cycles.device = "CPU"
+        scene.cycles.samples = 1
+        scene.cycles.use_denoising = False
+        scene.render.resolution_x = scene.render.resolution_y = 24
+        scene.render.resolution_percentage = 100
+        scene.view_settings.view_transform = "Standard"
+        scene.render.image_settings.file_format = "OPEN_EXR"
+        scene.render.image_settings.color_depth = "32"
+
+        def render(path, blend, through_breakup, **settings):
+            emission, value, breakup = (tree.nodes[n] for n in names)
+            value.outputs[0].default_value = blend
+            for key, v in settings.items():
+                breakup.inputs[key].default_value = v
+            if through_breakup:
+                tree.links.new(value.outputs[0], breakup.inputs["Blend"])
+                tree.links.new(breakup.outputs["Blend"], emission.inputs["Color"])
+            else:
+                tree.links.new(value.outputs[0], emission.inputs["Color"])
+            scene.render.filepath = str(path)
+            bpy.ops.render.render(write_still=True)
+            image = bpy.data.images.load(str(path), check_existing=False)
+            pixels = list(image.pixels)[0::4]
+            bpy.data.images.remove(image)
+            return pixels
+
+        defaults = {"Breakup": 0.0, "Sharpness": 0.0, "Noise Scale": 5.0}
+        strong = {"Breakup": 1.0, "Sharpness": 1.0, "Noise Scale": 30.0}
+        with tempfile.TemporaryDirectory(prefix="contact-blend-breakup-") as tmp:
+            out = pathlib.Path(tmp)
+            for blend in (0.0, 0.137, 0.5, 0.91, 1.0):
+                with self.subTest(blend=blend):
+                    direct = render(out / "direct.exr", blend, False)
+                    self.assertAlmostEqual(direct[0], blend, places=5)
+                    via = render(out / "via.exr", blend, True, **defaults)
+                    self.assertEqual(via, direct, "default breakup is not the identity")
+            for blend in (0.0, 1.0):
+                with self.subTest(blend=blend, settings="strong"):
+                    via = render(out / "strong.exr", blend, True, **strong)
+                    self.assertEqual(set(via), {blend}, "breakup moved an end of the ramp")
+            broken = render(out / "broken.exr", 0.5, True, **strong)
+            self.assertGreater(max(broken) - min(broken), 0.5, "breakup does nothing mid-ramp")
 
 
 if __name__ == "__main__":
