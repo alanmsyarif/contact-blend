@@ -308,7 +308,7 @@ class SharedGroundTests(SharedBase):
         self.assertEqual(bpy.ops.object.contact_blend_fit(), {"FINISHED"})
         for r in rocks:
             self.assertAlmostEqual(cb.socket(cb.find_mod(r), "Contact Distance"),
-                                   cb.object_width(r) / 3, places=5)
+                                   cb.object_width(r, self.ground) / 3, places=5)
         self.assertEqual(bpy.ops.object.contact_blend_update(), {"FINISHED"})
         for r in rocks:
             self.assertEqual(cb.out_of_sync(r, cb.find_mod(r)), [])
